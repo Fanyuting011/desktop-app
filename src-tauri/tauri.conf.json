@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
+  "productName": "Desktop Demo",
   "version": "0.1.0",
-  "identifier": "com.zhanglei.tauri-app",
+  "identifier": "com.example.desktop-demo",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
-        "width": 800,
-        "height": 600
+        "title": "Desktop Demo",
+        "width": 720,
+        "height": 480,
+        "resizable": true
       }
     ],
     "security": {
