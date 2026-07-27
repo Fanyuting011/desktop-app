@@ -12,7 +12,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-GITHUB_REPO ?= okboy32/desktop_app
+GITHUB_REPO ?= Fanyuting011/desktop-app
 KEY_FILE ?= $(HOME)/.tauri/desktop-demo.key
 BUNDLE_DIR := src-tauri/target/release/bundle
 RELEASE_DIR := release
