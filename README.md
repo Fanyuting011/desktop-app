@@ -1,10 +1,19 @@
-# Desktop Demo
+# OutGate
 
 ## 1. 这是什么
 
-这是一个可以安装到电脑上的小型桌面应用示例，使用 Tauri v2、React 和 TypeScript 编写。打开应用后，可以看到当前版本，也可以点击“检查更新”按钮下载并安装新版本。
+**OutGate** 是一个 Tauri 桌面应用：把无外网服务器的出站流量，经内网 SSH 反向隧道转到开发机，再（可选）走上游代理访问公网（如 GitHub）。
 
-即使你没有桌面应用开发经验，也可以按照本文一步一步完成本地运行、GitHub 自动打包和自动更新配置。
+操作流：**选择服务器 → 连接 → 开启代理**。连接时会自动把服务端 CLI 安装到 `~/.outgate/bin`，并写入 PATH。
+
+服务器常用命令：
+
+```bash
+outgate on --http http://127.0.0.1:17890 --socks socks5h://127.0.0.1:17891
+outgate off
+outgate status
+source ~/.outgate/env.sh          # 或: eval "$(outgate env)"
+```
 
 ## 2. 和「网站后端」的区别
 
@@ -43,23 +52,30 @@ npm install
 npm run tauri dev
 ```
 
-第一次运行需要下载并编译 Rust 依赖，等待时间可能较长。看到 Desktop Demo 窗口后即表示运行成功。修改 `src/` 中的界面代码并保存，窗口会自动刷新；在终端按 `Ctrl+C` 可以停止程序。
+第一次运行需要下载并编译 Rust 依赖，等待时间可能较长。看到应用窗口后即表示运行成功。修改 `src/` 中的界面代码并保存，窗口会自动刷新；在终端按 `Ctrl+C` 可以停止程序。
+
+Windows 网关功能需要本机可用的 **OpenSSH 客户端**（`ssh` 命令），以及能通过内网 SSH 登录目标服务器（建议密钥登录，`BatchMode`）。
+
+### 网关使用步骤
+
+1. **新建/选择服务器**：填写主机、端口、用户、私钥或密码；配置「不走代理」名单。
+2. （可选）填写**上游代理**（如 Clash `127.0.0.1:7890`）以便访问 GitHub。
+3. **连接**：本机监听代理 + SSH `-R`；并自动部署 `~/.outgate/bin/outgate`、注入 PATH。
+4. **开启代理**：远程执行 `outgate on`。
+5. 在服务器 shell：`source ~/.outgate/path.sh`（若新开终端可省略），再 `source ~/.outgate/env.sh`，然后用 curl 验证。
+6. **关闭代理** / **断开**：`outgate off` 或应用内按钮。
+
+服务器脚本：`scripts/server/outgate`、`deploy-outgate.sh`。
 
 ## 5. 项目结构说明
 
 ```text
 desktop_app/
-├── src/                    React 界面代码
-│   ├── App.tsx             主界面和检查更新逻辑
-│   └── App.css             界面样式
-├── src-tauri/              Tauri/Rust 桌面端代码
-│   ├── src/                Rust 入口和插件注册
-│   ├── Cargo.toml          Rust 包与依赖配置
-│   └── tauri.conf.json     应用名称、版本、打包和更新配置
-├── .github/workflows/
-│   └── release.yml         GitHub Actions 自动打包与发版流程
-├── package.json            前端依赖、脚本和版本
-└── README.md               本说明文档
+├── src/                    OutGate 界面
+├── src-tauri/src/gateway/  本地代理、SSH 隧道、多服务器配置
+├── scripts/server/         outgate CLI 与部署脚本
+├── docs/superpowers/specs/ 设计规格
+└── README.md
 ```
 
 ## 6. 配置自动更新（生成密钥、填写 `pubkey`、替换 `OWNER/REPO`、GitHub Secrets）

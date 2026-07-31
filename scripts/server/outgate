@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# OutGate server CLI (implementation). Installed to ~/.outgate/libexec/outgate
+# Interactive use goes through the shell function in ~/.outgate/path.sh so that
+# `outgate on` / `outgate off` apply to the *current* shell.
+set -euo pipefail
+
+OUTGATE_HOME="${OUTGATE_HOME:-$HOME/.outgate}"
+BIN_DIR="$OUTGATE_HOME/bin"
+LIBEXEC="$OUTGATE_HOME/libexec"
+ENV_FILE="$OUTGATE_HOME/env.sh"
+CONFIG_FILE="$OUTGATE_HOME/config"
+STATE_FILE="$OUTGATE_HOME/state"
+PATH_FILE="$OUTGATE_HOME/path.sh"
+MARKER="# outgate managed"
+
+usage() {
+  cat <<'EOF'
+OutGate — offline server outbound proxy helper
+
+Usage (after: source ~/.outgate/path.sh  — once per shell / auto via bashrc):
+  outgate on                 # enable proxy in *this* shell + write config
+  outgate off                # disable proxy in *this* shell
+  outgate status
+  outgate env
+  outgate version
+  outgate help
+
+Config (~/.outgate/config) is written by OutGate desktop on connect.
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$OUTGATE_HOME" "$BIN_DIR" "$LIBEXEC"
+}
+
+load_config() {
+  CONFIG_HTTP=""
+  CONFIG_SOCKS=""
+  CONFIG_NO_PROXY="127.0.0.1,localhost,::1"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    case "$line" in
+      http=*) CONFIG_HTTP="${line#http=}" ;;
+      socks=*) CONFIG_SOCKS="${line#socks=}" ;;
+      no_proxy=*) CONFIG_NO_PROXY="${line#no_proxy=}" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+write_path_hook() {
+  cat >"$PATH_FILE" <<'EOF'
+# outgate managed — shell hook (function overrides PATH binary)
+# Prefer libexec implementation; apply env to *current* shell on on/off.
+outgate() {
+  local _og_home="${OUTGATE_HOME:-$HOME/.outgate}"
+  local _og_cmd="${_og_home}/libexec/outgate"
+  if [[ ! -x "$_og_cmd" ]]; then
+    echo "outgate: missing ${_og_cmd}; reconnect from OutGate desktop" >&2
+    return 127
+  fi
+  case "${1:-}" in
+    on)
+      "$_og_cmd" "$@" || return $?
+      # shellcheck disable=SC1090
+      [[ -f "${_og_home}/env.sh" ]] && . "${_og_home}/env.sh"
+      echo "outgate: proxy enabled in this shell"
+      ;;
+    off)
+      "$_og_cmd" "$@" || return $?
+      unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy 2>/dev/null || true
+      echo "outgate: proxy disabled in this shell"
+      ;;
+    *)
+      "$_og_cmd" "$@"
+      ;;
+  esac
+}
+# Ensure libexec helpers stay reachable if needed
+case ":$PATH:" in
+  *":$HOME/.outgate/bin:"*) ;;
+  *) export PATH="$HOME/.outgate/bin:$PATH" ;;
+esac
+EOF
+}
+
+install_path_hook() {
+  write_path_hook
+  local line='[ -f "$HOME/.outgate/path.sh" ] && . "$HOME/.outgate/path.sh"  # outgate managed'
+  local f
+  for f in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+    if [[ -f "$f" ]] || [[ "$f" == "$HOME/.bashrc" ]]; then
+      touch "$f"
+      if ! grep -qF "outgate managed" "$f" 2>/dev/null; then
+        printf '\n%s\n' "$line" >>"$f"
+      fi
+    fi
+  done
+}
+
+write_bin_shim() {
+  # If hook not loaded, remind user (function normally shadows this).
+  cat >"$BIN_DIR/outgate" <<'EOF'
+#!/usr/bin/env bash
+echo "outgate: shell hook not loaded in this shell." >&2
+echo "  Run:  source ~/.outgate/path.sh" >&2
+echo "  Then: outgate $*" >&2
+exit 1
+EOF
+  chmod 755 "$BIN_DIR/outgate"
+}
+
+cmd_on() {
+  ensure_dirs
+  load_config
+
+  local http="${GATEWAY_HTTP_PROXY:-$CONFIG_HTTP}"
+  local socks="${GATEWAY_ALL_PROXY:-$CONFIG_SOCKS}"
+  local nop="${GATEWAY_NO_PROXY:-$CONFIG_NO_PROXY}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --http) http="${2:-}"; shift 2 ;;
+      --socks) socks="${2:-}"; shift 2 ;;
+      --no-proxy) nop="${2:-}"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$http" ]]; then
+    echo "error: no proxy URL in ~/.outgate/config — connect once from OutGate desktop" >&2
+    exit 2
+  fi
+
+  cat >"$CONFIG_FILE" <<EOF
+${MARKER}
+http=${http}
+socks=${socks}
+no_proxy=${nop}
+EOF
+
+  cat >"$ENV_FILE" <<EOF
+${MARKER}
+export http_proxy="${http}"
+export https_proxy="${http}"
+export HTTP_PROXY="${http}"
+export HTTPS_PROXY="${http}"
+export ALL_PROXY="${socks}"
+export all_proxy="${socks}"
+export NO_PROXY="${nop}"
+export no_proxy="${nop}"
+EOF
+  chmod 644 "$ENV_FILE" "$CONFIG_FILE"
+  echo "on" >"$STATE_FILE"
+  install_path_hook
+  write_bin_shim
+
+  echo "outgate: proxy ON (files updated)"
+  echo "  HTTP_PROXY=${http}"
+  echo "  ALL_PROXY=${socks}"
+  echo "  NO_PROXY=${nop}"
+}
+
+cmd_off() {
+  ensure_dirs
+  rm -f "$ENV_FILE"
+  echo "off" >"$STATE_FILE"
+  echo "outgate: proxy OFF (files updated; config kept)"
+}
+
+cmd_status() {
+  load_config
+  local st="off"
+  [[ -f "$STATE_FILE" ]] && st="$(tr -d '[:space:]' <"$STATE_FILE" || true)"
+  [[ -f "$ENV_FILE" ]] || st="off"
+  echo "state=${st}"
+  echo "home=${OUTGATE_HOME}"
+  echo "hook=$(type outgate 2>/dev/null | head -1 || echo 'not loaded — source ~/.outgate/path.sh')"
+  echo "HTTP_PROXY_in_shell=${HTTP_PROXY:-}"
+  echo "config_http=${CONFIG_HTTP:-}"
+  echo "config_socks=${CONFIG_SOCKS:-}"
+}
+
+cmd_env() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "echo 'outgate: proxy is off' >&2; false"
+    exit 1
+  fi
+  cat "$ENV_FILE"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    on) cmd_on "$@" ;;
+    off) cmd_off "$@" ;;
+    status) cmd_status "$@" ;;
+    env) cmd_env "$@" ;;
+    version|--version|-V) echo "outgate 1.1.0" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
