@@ -47,7 +47,9 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     const injectOnce = () => {
       if (injectedRef.current) return;
       injectedRef.current = true;
-      invoke("gateway_terminal_write", { profileId, data: INJECT_CMD }).catch(() => {});
+      invoke("gateway_terminal_write", { profileId, data: INJECT_CMD }).catch((error) => {
+        console.warn(`Failed to inject OutGate environment for profile ${profileId}`, error);
+      });
     };
     const injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
 

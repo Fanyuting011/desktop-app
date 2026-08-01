@@ -1,7 +1,7 @@
 # OutGate 内嵌终端 + 按 Host 网络日志 设计规格
 
 **日期：** 2026-08-01  
-**状态：** 待实现（已确认）  
+**状态：** 已实现（代码完成，人工 E2E 待验）  
 **前置：** 多 Host 并行隧道（`feat/ssh-gateway-proxy` / v0.1.6）  
 **相关：** `2026-07-31-ssh-gateway-proxy-design.md`、`2026-07-31-outgate-termius-ui-design.md`
 
