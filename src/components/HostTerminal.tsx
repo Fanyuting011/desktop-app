@@ -9,10 +9,13 @@ interface HostTerminalProps {
   profileId: string;
 }
 
-// Written once the PTY is ready (first output chunk, or 800ms if the server
-// stays quiet) — never touches the user's global shell rc files.
-const INJECT_CMD = "source ~/.outgate/path.sh && outgate on\n";
-const INJECT_TIMEOUT_MS = 800;
+// Written once the PTY is ready — never touches the user's global shell rc files.
+// Use CR (`\r`) like a real Enter key: Windows ConPTY / OpenSSH often ignore bare LF
+// and never submit the line, so the inject appears to "not run" on Windows.
+const INJECT_CMD = ". ~/.outgate/path.sh && outgate on\r";
+const INJECT_TIMEOUT_MS = 1200;
+const INJECT_RETRY_MS = 500;
+const INJECT_MAX_ATTEMPTS = 8;
 
 export default function HostTerminal({ profileId }: HostTerminalProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -82,19 +85,34 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     });
 
     const injectedRef = { current: false };
-    const injectOnce = () => {
-      if (injectedRef.current) return;
-      injectedRef.current = true;
+    const injectingRef = { current: false };
+    let injectAttempts = 0;
+    let injectRetryTimer = 0;
+
+    const injectOnce = (reason: "output" | "timeout" | "retry") => {
+      if (cancelled || injectedRef.current || injectingRef.current) return;
+      injectingRef.current = true;
       void (async () => {
+        injectAttempts += 1;
         await sendResize(true);
         try {
           await invoke("gateway_terminal_write", { profileId, data: INJECT_CMD });
+          injectedRef.current = true;
         } catch (error) {
-          console.warn(`Failed to inject OutGate environment for profile ${profileId}`, error);
+          console.warn(
+            `Failed to inject OutGate environment for profile ${profileId} (${reason}, attempt ${injectAttempts})`,
+            error,
+          );
+          if (!cancelled && injectAttempts < INJECT_MAX_ATTEMPTS) {
+            injectRetryTimer = window.setTimeout(() => injectOnce("retry"), INJECT_RETRY_MS);
+          }
+        } finally {
+          injectingRef.current = false;
         }
       })();
     };
-    let injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
+
+    let injectTimer = window.setTimeout(() => injectOnce("timeout"), INJECT_TIMEOUT_MS);
     const unlisteners: Array<() => void> = [];
     const track = (fn: () => void) => {
       if (cancelled) fn();
@@ -104,7 +122,7 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     listen<string>(`terminal-output-${profileId}`, (event) => {
       term.write(event.payload);
       void sendResize();
-      injectOnce();
+      injectOnce("output");
     }).then(track);
 
     const dataDisposable = term.onData((data) => {
@@ -120,16 +138,19 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
       term.reset();
       term.writeln("\x1b[2m— 隧道已重连，终端会话已重建 —\x1b[0m");
       injectedRef.current = false;
+      injectAttempts = 0;
       resizeSynced = false;
       lastSent = { cols: 0, rows: 0 };
       window.clearTimeout(injectTimer);
-      injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
+      window.clearTimeout(injectRetryTimer);
+      injectTimer = window.setTimeout(() => injectOnce("timeout"), INJECT_TIMEOUT_MS);
       void sendResize(true);
     }).then(track);
 
     return () => {
       cancelled = true;
       window.clearTimeout(injectTimer);
+      window.clearTimeout(injectRetryTimer);
       window.clearInterval(resizeRetry);
       resizeObserver.disconnect();
       dataDisposable.dispose();
