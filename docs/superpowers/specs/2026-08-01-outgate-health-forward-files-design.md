@@ -1,7 +1,7 @@
 # OutGate：失败可解释 + 本地预览转发 + 轻量传文件
 
 **日期：** 2026-08-01  
-**状态：** 设计已确认；实现计划见 `docs/superpowers/plans/2026-08-01-outgate-health-forward-files.md`  
+**状态：** 已实现（代码完成，人工 E2E 待验）；实现计划见 `docs/superpowers/plans/2026-08-01-outgate-health-forward-files.md`  
 **前置：** 多 Host 隧道、内嵌终端、Network 日志（`2026-08-01-outgate-terminal-design.md`）  
 **方案：** 系统 SSH 增强（不用 ControlMaster / 自研 SSH）
 
