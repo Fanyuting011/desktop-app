@@ -3,6 +3,25 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+fn default_loopback() -> String {
+    "127.0.0.1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortForwardRule {
+    pub id: String,
+    pub enabled: bool,
+    #[serde(default = "default_loopback")]
+    pub local_host: String,
+    pub local_port: u16,
+    #[serde(default = "default_loopback")]
+    pub remote_host: String,
+    pub remote_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayProfile {
@@ -19,6 +38,8 @@ pub struct GatewayProfile {
     pub remote_socks_port: u16,
     pub auto_reconnect: bool,
     pub no_proxy: Vec<String>,
+    #[serde(default)]
+    pub port_forwards: Vec<PortForwardRule>,
     pub updated_at: String,
 }
 
@@ -44,7 +65,20 @@ impl GatewayProfile {
             remote_socks_port: 17891,
             auto_reconnect: true,
             no_proxy: Self::default_no_proxy(),
+            port_forwards: vec![],
             updated_at: chrono_like_now(),
+        }
+    }
+
+    pub fn preset_forward(port: u16) -> PortForwardRule {
+        PortForwardRule {
+            id: Uuid::new_v4().to_string(),
+            enabled: true,
+            local_host: "127.0.0.1".into(),
+            local_port: port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: port,
+            label: Some(format!("{port}")),
         }
     }
 
@@ -170,4 +204,16 @@ fn chrono_like_now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_port_forwards_defaults_empty() {
+        let raw = r#"{"id":"1","name":"t","host":"h","port":22,"user":"u","identityFile":"","password":"","remoteHttpPort":17890,"remoteSocksPort":17891,"autoReconnect":true,"noProxy":[],"updatedAt":"x"}"#;
+        let p: GatewayProfile = serde_json::from_str(raw).unwrap();
+        assert!(p.port_forwards.is_empty());
+    }
 }
