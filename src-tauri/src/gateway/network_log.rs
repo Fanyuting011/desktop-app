@@ -14,6 +14,8 @@ pub struct NetworkLogEntry {
     pub target: String,
     pub ok: bool,
     pub error: Option<String>,
+    pub category: String,
+    pub hint: Option<String>,
 }
 
 pub struct NetworkLogBuffer {
@@ -76,6 +78,8 @@ mod tests {
             target: "example.com".into(),
             ok: true,
             error: None,
+            category: "ok".into(),
+            hint: None,
         }
     }
 

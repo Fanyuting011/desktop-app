@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
+use super::classify::classify_network_error;
 use super::network_log::{NetworkLogBuffer, NetworkLogEntry};
 
 #[derive(Debug, Clone)]
@@ -141,6 +142,7 @@ fn push_network_log(
     target: &str,
     error: Option<String>,
 ) {
+    let (category, hint) = classify_network_error(error.as_deref());
     net_log.push(NetworkLogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         ts_ms: now_ms(),
@@ -149,6 +151,8 @@ fn push_network_log(
         target: target.to_string(),
         ok: error.is_none(),
         error,
+        category,
+        hint,
     });
 }
 
