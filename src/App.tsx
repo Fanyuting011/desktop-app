@@ -5,10 +5,13 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import LogsPanel from "./components/LogsPanel";
 import NetworkPanel from "./components/NetworkPanel";
+import HostTerminal from "./components/HostTerminal";
 import "./App.css";
 
 type Phase = "idle" | "connected" | "proxyOn" | "reconnecting";
 type Nav = "hosts" | "logs" | "network";
+// "hosts" or a connected session's profileId (its terminal tab).
+type CenterTab = string;
 
 interface GatewayProfile {
   id: string;
@@ -77,6 +80,7 @@ function statusDot(phase: Phase, busy: boolean): string {
 
 export default function App() {
   const [nav, setNav] = useState<Nav>("hosts");
+  const [centerTab, setCenterTab] = useState<CenterTab>("hosts");
   const [version, setVersion] = useState("…");
   const [profiles, setProfiles] = useState<GatewayProfile[]>([]);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
@@ -110,6 +114,14 @@ export default function App() {
         p.user.toLowerCase().includes(q),
     );
   }, [profiles, query]);
+
+  const nameOf = useCallback(
+    (id: string) => {
+      const p = profiles.find((x) => x.id === id);
+      return p?.name || p?.host || id;
+    },
+    [profiles],
+  );
 
   const refresh = useCallback(async () => {
     const [plist, st] = await Promise.all([
@@ -216,6 +228,32 @@ export default function App() {
         upstreamProxy: upstream.trim() || null,
       });
       setStatus(st);
+      setCenterTab(id);
+      try {
+        await invoke("gateway_terminal_open", { profileId: id });
+      } catch (e) {
+        setMessage(String(e));
+      }
+      await refresh();
+    } catch (e) {
+      setMessage(String(e));
+      await refresh();
+    } finally {
+      setBusy(false);
+      setBusyId(null);
+    }
+  }
+
+  async function disconnectProfile(id: string) {
+    setBusy(true);
+    setBusyId(id);
+    setMessage("");
+    try {
+      const st = await invoke<GatewayStatus>("gateway_disconnect", {
+        profileId: id,
+      });
+      setStatus(st);
+      setCenterTab((prev) => (prev === id ? "hosts" : prev));
       await refresh();
     } catch (e) {
       setMessage(String(e));
@@ -228,23 +266,7 @@ export default function App() {
 
   async function disconnect() {
     if (!draft) return;
-    const id = draft.id;
-    setBusy(true);
-    setBusyId(id);
-    setMessage("");
-    try {
-      const st = await invoke<GatewayStatus>("gateway_disconnect", {
-        profileId: id,
-      });
-      setStatus(st);
-      await refresh();
-    } catch (e) {
-      setMessage(String(e));
-      await refresh();
-    } finally {
-      setBusy(false);
-      setBusyId(null);
-    }
+    await disconnectProfile(draft.id);
   }
 
   async function checkUpdate() {
@@ -274,8 +296,10 @@ export default function App() {
     }
   }
 
+  const terminalFocused = nav === "hosts" && centerTab !== "hosts";
+
   return (
-    <div className="shell">
+    <div className={terminalFocused ? "shell wide-center" : "shell"}>
       <aside className="nav">
         <div className="brand">OutGate</div>
         <button
@@ -307,57 +331,118 @@ export default function App() {
         </div>
       </aside>
 
-      {nav === "hosts" ? (
-        <>
-          <section className="center">
-            <div className="toolbar">
-              <input
-                className="search"
-                placeholder="Find a host or user@hostname…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-              />
-              <button type="button" className="btn ghost" disabled={busy} onClick={createProfile}>
-                + New host
-              </button>
+      {
+        /* The Hosts workspace (tab bar + host grid/terminal panes) always stays
+           mounted — only its visibility is toggled — so an open HostTerminal
+           keeps its xterm instance, scrollback and listeners alive while the
+           user browses Logs/Network and comes back, instead of losing state
+           and re-running the outgate-on injection on every nav switch. */
+      }
+      <>
+        <section
+          className={terminalFocused ? "center center-terminal" : "center"}
+          style={{ display: nav === "hosts" ? "flex" : "none" }}
+        >
+          <div className="tabbar">
+            <button
+              type="button"
+              className={centerTab === "hosts" ? "tab active" : "tab"}
+              onClick={() => setCenterTab("hosts")}
+            >
+              Hosts
+            </button>
+            {status?.sessions.map((s) => (
               <button
+                key={s.profileId}
                 type="button"
-                className="btn primary"
-                disabled={busy || !draft || draftConnected}
-                onClick={connect}
+                className={centerTab === s.profileId ? "tab active" : "tab"}
+                onClick={() => setCenterTab(s.profileId)}
               >
-                {busyId === draft?.id && !draftConnected ? "Connecting…" : "Connect"}
+                {nameOf(s.profileId)}
+                <span
+                  className="tab-close"
+                  role="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    disconnectProfile(s.profileId);
+                  }}
+                >
+                  ×
+                </span>
               </button>
-            </div>
+            ))}
+          </div>
 
-            <h2 className="section-title">Hosts</h2>
-            <div className="host-scroll scroll">
-              <div className="host-grid">
-                {filtered.map((p) => {
-                  const selected = draft?.id === p.id;
-                  const phase = phaseOf(status, p.id);
-                  return (
-                    <button
-                      key={p.id}
-                      type="button"
-                      className={selected ? "host-card selected" : "host-card"}
-                      onClick={() => selectProfile(p.id)}
-                    >
-                      <span className={statusDot(phase, busyId === p.id)} />
-                      <strong>{p.name || p.host || "未命名"}</strong>
-                      <span className="sub">
-                        ssh, {p.user || "?"}@{p.host || "?"}
-                      </span>
-                    </button>
-                  );
-                })}
+          {centerTab === "hosts" && (
+            <>
+              <div className="toolbar">
+                <input
+                  className="search"
+                  placeholder="Find a host or user@hostname…"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                />
+                <button type="button" className="btn ghost" disabled={busy} onClick={createProfile}>
+                  + New host
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={busy || !draft || draftConnected}
+                  onClick={connect}
+                >
+                  {busyId === draft?.id && !draftConnected ? "Connecting…" : "Connect"}
+                </button>
               </div>
-              {filtered.length === 0 && (
-                <p className="empty">暂无主机，点击 + New host</p>
-              )}
-            </div>
-          </section>
 
+              <h2 className="section-title">Hosts</h2>
+              <div className="host-scroll scroll">
+                <div className="host-grid">
+                  {filtered.map((p) => {
+                    const selected = draft?.id === p.id;
+                    const phase = phaseOf(status, p.id);
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className={selected ? "host-card selected" : "host-card"}
+                        onClick={() => selectProfile(p.id)}
+                      >
+                        <span className={statusDot(phase, busyId === p.id)} />
+                        <strong>{p.name || p.host || "未命名"}</strong>
+                        <span className="sub">
+                          ssh, {p.user || "?"}@{p.host || "?"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {filtered.length === 0 && (
+                  <p className="empty">暂无主机，点击 + New host</p>
+                )}
+              </div>
+            </>
+          )}
+
+          {status && status.sessions.length > 0 && (
+            <div
+              className="terminal-stack"
+              style={{ display: centerTab === "hosts" ? "none" : "flex" }}
+            >
+              {status.sessions.map((s) => (
+                <div
+                  key={s.profileId}
+                  className="terminal-pane"
+                  style={{ display: s.profileId === centerTab ? "flex" : "none" }}
+                >
+                  <HostTerminal profileId={s.profileId} />
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {nav === "hosts" && centerTab === "hosts" && (
           <aside className="details">
             <header className="details-head">
               <h2>Host Details</h2>
@@ -539,12 +624,11 @@ export default function App() {
               </div>
             )}
           </aside>
-        </>
-      ) : nav === "logs" ? (
-        <LogsPanel profiles={profiles} />
-      ) : (
-        <NetworkPanel active={nav === "network"} profiles={profiles} />
-      )}
+        )}
+      </>
+
+      {nav === "logs" && <LogsPanel profiles={profiles} />}
+      {nav === "network" && <NetworkPanel active={nav === "network"} profiles={profiles} />}
     </div>
   );
 }
