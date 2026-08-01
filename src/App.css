@@ -465,10 +465,34 @@ body,
   padding: 16px 18px;
 }
 
-.logs-page h2 {
+.page-head {
   flex-shrink: 0;
-  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.page-head h2 {
+  margin: 0;
   font-size: 14px;
+}
+
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filter-select {
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #fff;
+  font-size: 12px;
+  color: var(--text);
 }
 
 .logs-page pre {
@@ -491,6 +515,92 @@ body,
 }
 
 .logs-page .banner {
+  flex-shrink: 0;
+  margin-top: 10px;
+}
+
+.network-page {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  padding: 16px 18px;
+}
+
+.network-table-wrap {
+  flex: 1;
+  min-height: 0;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.network-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.network-table th,
+.network-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.network-table td.mono {
+  font-family: "SF Mono", "Menlo", ui-monospace, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.network-table th {
+  position: sticky;
+  top: 0;
+  background: #f7f8fa;
+  color: var(--muted);
+  font-weight: 600;
+  z-index: 1;
+}
+
+.network-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.network-table tbody tr:hover {
+  background: #fafbfc;
+}
+
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.tag.ok {
+  background: #ecfdf3;
+  color: #16a34a;
+}
+
+.tag.err {
+  background: #fef3f2;
+  color: #b42318;
+  cursor: help;
+}
+
+.network-page .empty {
+  text-align: center;
+  padding: 24px 0;
+}
+
+.network-page .banner {
   flex-shrink: 0;
   margin-top: 10px;
 }
@@ -532,7 +642,8 @@ body,
     border-top: 1px solid var(--border);
   }
 
-  .logs-page {
+  .logs-page,
+  .network-page {
     grid-column: 2;
     grid-row: 1 / -1;
   }

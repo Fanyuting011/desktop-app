@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import LogsPanel from "./components/LogsPanel";
+import NetworkPanel from "./components/NetworkPanel";
 import "./App.css";
 
 type Phase = "idle" | "connected" | "proxyOn" | "reconnecting";
-type Nav = "hosts" | "logs";
+type Nav = "hosts" | "logs" | "network";
 
 interface GatewayProfile {
   id: string;
@@ -27,6 +29,8 @@ interface SessionInfo {
   profileId: string;
   phase: Phase;
   lastError: string | null;
+  localHttpPort: number;
+  localSocksPort: number;
 }
 
 interface GatewayStatus {
@@ -76,7 +80,6 @@ export default function App() {
   const [version, setVersion] = useState("…");
   const [profiles, setProfiles] = useState<GatewayProfile[]>([]);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
   const [draft, setDraft] = useState<GatewayProfile | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -109,14 +112,12 @@ export default function App() {
   }, [profiles, query]);
 
   const refresh = useCallback(async () => {
-    const [plist, st, logLines] = await Promise.all([
+    const [plist, st] = await Promise.all([
       invoke<GatewayProfile[]>("gateway_list_profiles"),
       invoke<GatewayStatus>("gateway_get_status"),
-      invoke<string[]>("gateway_get_logs", { limit: 120 }),
     ]);
     setProfiles(plist);
     setStatus(st);
-    setLogs(logLines);
     setDraft((prev) => {
       if (prev) {
         const latest = plist.find((p) => p.id === prev.id);
@@ -138,11 +139,7 @@ export default function App() {
   useEffect(() => {
     const id = window.setInterval(() => {
       invoke<GatewayStatus>("gateway_poll")
-        .then((st) => {
-          setStatus(st);
-          return invoke<string[]>("gateway_get_logs", { limit: 120 });
-        })
-        .then(setLogs)
+        .then(setStatus)
         .catch(() => {});
     }, 3000);
     return () => window.clearInterval(id);
@@ -294,6 +291,13 @@ export default function App() {
           onClick={() => setNav("logs")}
         >
           Logs
+        </button>
+        <button
+          type="button"
+          className={nav === "network" ? "nav-item active" : "nav-item"}
+          onClick={() => setNav("network")}
+        >
+          Network
         </button>
         <div className="nav-foot">
           <button type="button" className="nav-update" disabled={busy} onClick={checkUpdate}>
@@ -536,12 +540,10 @@ export default function App() {
             )}
           </aside>
         </>
+      ) : nav === "logs" ? (
+        <LogsPanel profiles={profiles} />
       ) : (
-        <section className="logs-page">
-          <h2>Logs</h2>
-          <pre>{logs.length ? logs.join("\n") : "暂无日志"}</pre>
-          {message && <p className="banner">{message}</p>}
-        </section>
+        <NetworkPanel active={nav === "network"} profiles={profiles} />
       )}
     </div>
   );
