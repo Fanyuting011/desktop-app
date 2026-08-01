@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use super::log_buffer::LogBuffer;
-use super::network_log::NetworkLogBuffer;
+use super::network_log::{NetworkLogBuffer, NetworkLogEntry};
 use super::port_alloc::allocate_port_pair;
 use super::profiles::{GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
@@ -202,8 +202,27 @@ impl GatewayState {
         })
     }
 
-    pub fn get_logs(&self, limit: usize) -> Vec<String> {
-        self.with_inner(|i| i.logs.snapshot(limit))
+    pub fn get_logs(&self, limit: usize, profile_id: Option<String>) -> Vec<String> {
+        self.with_inner(|i| match profile_id {
+            None => i.logs.snapshot(limit),
+            Some(profile_id) => {
+                let profile_name = i.profiles.get(&profile_id).map(|profile| profile.name);
+                i.logs
+                    .snapshot_filtered(limit, &profile_id, profile_name.as_deref())
+            }
+        })
+    }
+
+    pub fn get_network_logs(
+        &self,
+        profile_id: Option<String>,
+        limit: usize,
+    ) -> Vec<NetworkLogEntry> {
+        self.with_inner(|i| i.network_logs.snapshot(profile_id.as_deref(), limit))
+    }
+
+    pub fn clear_network_logs(&self, profile_id: Option<String>) {
+        self.with_inner(|i| i.network_logs.clear(profile_id.as_deref()));
     }
 
     pub fn connect(

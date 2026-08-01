@@ -1,6 +1,6 @@
 mod gateway;
 
-use gateway::{GatewayProfile, GatewayState};
+use gateway::{GatewayProfile, GatewayState, NetworkLogEntry};
 use tauri::Manager;
 
 #[tauri::command]
@@ -40,8 +40,26 @@ fn gateway_get_status(
 }
 
 #[tauri::command]
-fn gateway_get_logs(state: tauri::State<'_, GatewayState>, limit: usize) -> Vec<String> {
-    state.get_logs(limit)
+fn gateway_get_logs(
+    state: tauri::State<'_, GatewayState>,
+    limit: usize,
+    profile_id: Option<String>,
+) -> Vec<String> {
+    state.get_logs(limit, profile_id)
+}
+
+#[tauri::command]
+fn gateway_get_network_logs(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: Option<String>,
+    limit: usize,
+) -> Vec<NetworkLogEntry> {
+    state.get_network_logs(profile_id, limit)
+}
+
+#[tauri::command]
+fn gateway_clear_network_logs(state: tauri::State<'_, GatewayState>, profile_id: Option<String>) {
+    state.clear_network_logs(profile_id)
 }
 
 #[tauri::command]
@@ -109,6 +127,8 @@ pub fn run() {
             gateway_set_active_profile,
             gateway_get_status,
             gateway_get_logs,
+            gateway_get_network_logs,
+            gateway_clear_network_logs,
             gateway_connect,
             gateway_disconnect,
             gateway_poll,

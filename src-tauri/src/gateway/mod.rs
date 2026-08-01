@@ -8,4 +8,5 @@ mod proxy;
 mod ssh_tunnel;
 
 pub use manager::GatewayState;
+pub use network_log::NetworkLogEntry;
 pub use profiles::GatewayProfile;
