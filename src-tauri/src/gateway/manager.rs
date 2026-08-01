@@ -62,6 +62,9 @@ struct LiveSession {
     local_socks: u16,
     /// Monotonic session token used to discard stale tunnel spawn completions.
     generation: u64,
+    /// An auto-reconnect closed an interactive terminal that must be recreated once a
+    /// replacement data-plane tunnel has been installed.
+    terminal_reopen_required: bool,
     phase: Phase,
     last_error: Option<String>,
 }
@@ -397,6 +400,7 @@ impl GatewayState {
                     local_http,
                     local_socks,
                     generation,
+                    terminal_reopen_required: false,
                     phase: Phase::Connected,
                     last_error: None,
                 },
@@ -508,6 +512,7 @@ impl GatewayState {
                         if let Some(session) = i.sessions.get_mut(&id) {
                             session.phase = Phase::Reconnecting;
                             session.generation = generation;
+                            session.terminal_reopen_required |= had_terminal;
                             to_reconnect.push((id.clone(), generation, had_terminal));
                             i.reconnecting.insert(id.clone(), generation);
                         }
@@ -572,10 +577,12 @@ impl GatewayState {
             session.tunnel = tunnel.take().expect("tunnel is available for installation");
             session.phase = Phase::Connected;
             session.last_error = None;
+            let reopen_terminal = session.terminal_reopen_required || reopen_terminal;
+            session.terminal_reopen_required = false;
             i.logs.push(format!("[{}] 重连成功", profile.name));
-            Some((i.app.clone(), i.terminals.clone()))
+            Some((i.app.clone(), i.terminals.clone(), reopen_terminal))
         });
-        let Some((app, terminals)) = install else {
+        let Some((app, terminals, reopen_terminal)) = install else {
             if let Some(mut tunnel) = tunnel {
                 tunnel.kill();
             }
@@ -689,29 +696,32 @@ impl GatewayState {
         })?;
 
         let tunnel = SshTunnel::spawn(&latest_profile, local_http, local_socks, logs);
-        self.with_inner(|i| {
+        let (reopen_terminal, app, terminals) = self.with_inner(|i| {
             if i.reconnecting.get(&id) == Some(&generation) {
                 i.reconnecting.remove(&id);
             }
             match tunnel {
                 Ok(tunnel) => {
                     let mut tunnel = Some(tunnel);
-                    let installed = if let Some(session) = i.sessions.get_mut(&id) {
+                    let reopen_terminal = if let Some(session) = i.sessions.get_mut(&id) {
                         if session.generation != generation {
-                            false
+                            None
                         } else {
                             session.tunnel =
                                 tunnel.take().expect("tunnel is available for installation");
+                            session.phase = Phase::Connected;
                             session.last_error = None;
-                            true
+                            let reopen_terminal = session.terminal_reopen_required;
+                            session.terminal_reopen_required = false;
+                            Some(reopen_terminal)
                         }
                     } else {
-                        false
+                        None
                     };
-                    if installed {
+                    if let Some(reopen_terminal) = reopen_terminal {
                         i.logs
                             .push(format!("[{}] 已应用端口转发预设", latest_profile.name));
-                        Ok(())
+                        Ok((reopen_terminal, i.app.clone(), i.terminals.clone()))
                     } else {
                         if let Some(mut tunnel) = tunnel {
                             tunnel.kill();
@@ -739,7 +749,22 @@ impl GatewayState {
                     }
                 }
             }
-        })
+        })?;
+
+        if reopen_terminal {
+            match terminals.open(app.clone(), &latest_profile) {
+                Ok(()) => {
+                    let _ = app.emit(&format!("terminal-reconnect-{id}"), ());
+                }
+                Err(error) => self.with_inner(|i| {
+                    i.logs.push(format!(
+                        "[{}] 应用端口转发预设后恢复终端失败: {error}",
+                        latest_profile.name
+                    ));
+                }),
+            }
+        }
+        Ok(())
     }
 
     /// Open an interactive PTY-backed `ssh` session for `profile_id`'s embedded terminal.
