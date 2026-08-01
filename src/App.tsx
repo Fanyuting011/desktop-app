@@ -102,6 +102,10 @@ export default function App() {
   const draftConnected = isLive(draftPhase);
   const draftEditable = !draftConnected;
   const anyConnected = (status?.sessions?.length ?? 0) > 0;
+  const noProxySummary =
+    draft?.noProxy.join(", ") ??
+    profiles.find((profile) => profile.id === status?.activeProfileId)?.noProxy.join(", ") ??
+    "";
   const draftError = errorOf(status, draft?.id);
 
   const filtered = useMemo(() => {
@@ -628,7 +632,13 @@ export default function App() {
       </>
 
       {nav === "logs" && <LogsPanel profiles={profiles} />}
-      {nav === "network" && <NetworkPanel active={nav === "network"} profiles={profiles} />}
+      {nav === "network" && (
+        <NetworkPanel
+          active={nav === "network"}
+          profiles={profiles}
+          noProxySummary={noProxySummary}
+        />
+      )}
     </div>
   );
 }

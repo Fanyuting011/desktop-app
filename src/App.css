@@ -617,6 +617,22 @@ body,
   padding: 16px 18px;
 }
 
+.network-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.network-fail-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .network-table-wrap {
   flex: 1;
   min-height: 0;
@@ -661,6 +677,28 @@ body,
 
 .network-table tbody tr:hover {
   background: #fafbfc;
+}
+
+.network-row.fail-latest {
+  background: #fef2f2;
+  box-shadow: inset 3px 0 0 #ef4444;
+}
+
+.network-row.fail {
+  background: #fff7f7;
+}
+
+.network-row.fail-latest:hover,
+.network-row.fail:hover {
+  background: #feeaea;
+}
+
+.network-hint {
+  display: block;
+  max-width: 280px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: normal;
 }
 
 .tag {
