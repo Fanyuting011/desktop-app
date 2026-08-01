@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::log_buffer::LogBuffer;
 use super::network_log::{NetworkLogBuffer, NetworkLogEntry};
@@ -77,6 +77,9 @@ impl Clone for GatewayState {
 }
 
 struct Inner {
+    /// Kept so background paths that have no command-invocation `AppHandle` of their own
+    /// (auto-reconnect) can still reopen the PTY and emit frontend events.
+    app: AppHandle,
     profiles: ProfilesStore,
     logs: Arc<LogBuffer>,
     network_logs: Arc<NetworkLogBuffer>,
@@ -85,6 +88,10 @@ struct Inner {
     /// `connect()` for the same host starting a duplicate proxy/tunnel before the first
     /// one has inserted its session (see `PendingGuard`).
     pending: HashSet<String>,
+    /// Profile ids whose tunnel is currently being respawned by `reconnect_one`. A dead
+    /// tunnel keeps reporting dead from `try_wait()` until it is replaced, so without this
+    /// guard every 3s poll would enqueue yet another reconnect on top of the in-flight one.
+    reconnecting: HashSet<String>,
     upstream: Option<UpstreamKind>,
     runtime: Option<tokio::runtime::Runtime>,
     /// Interactive PTY-backed `ssh` sessions for the embedded terminal — independent of
@@ -122,11 +129,13 @@ impl GatewayState {
             .ok();
         Self {
             inner: Arc::new(Mutex::new(Inner {
+                app: app.clone(),
                 profiles: ProfilesStore::load(path),
                 logs: Arc::new(LogBuffer::new()),
                 network_logs: Arc::new(NetworkLogBuffer::new()),
                 sessions: HashMap::new(),
                 pending: HashSet::new(),
+                reconnecting: HashSet::new(),
                 upstream: None,
                 runtime,
                 terminals: Arc::new(TerminalHub::new()),
@@ -439,11 +448,18 @@ impl GatewayState {
     }
 
     pub fn poll_and_maybe_reconnect(&self) -> Result<GatewayStatus, String> {
-        let mut to_reconnect: Vec<GatewayProfile> = Vec::new();
+        // (profile, whether an interactive terminal was open before the tunnel died)
+        let mut to_reconnect: Vec<(GatewayProfile, bool)> = Vec::new();
 
         self.with_inner(|i| {
             let ids: Vec<String> = i.sessions.keys().cloned().collect();
             for id in ids {
+                // A reconnect already in flight owns this session's tunnel: its old handle
+                // still reports dead, so re-running the dead path here would kill the
+                // terminal again and queue duplicate reconnects.
+                if i.reconnecting.contains(&id) {
+                    continue;
+                }
                 let dead = {
                     let session = i.sessions.get_mut(&id).unwrap();
                     match session.tunnel.try_wait() {
@@ -464,10 +480,10 @@ impl GatewayState {
                 if dead {
                     // The interactive terminal (if open) is a second, independent ssh
                     // process tied to the same host. Once the tunnel itself has died,
-                    // close it too — whether we're about to auto-reconnect (Task 8's UI
-                    // will reopen a fresh terminal once reconnected) or dropping the
-                    // session entirely — so it never leaks as an orphaned ssh process.
-                    i.terminals.close(&id);
+                    // close it too — whether we're about to auto-reconnect (in which case
+                    // `reconnect_one` reopens it) or dropping the session entirely — so it
+                    // never leaks as an orphaned ssh process.
+                    let had_terminal = i.terminals.close(&id);
 
                     let (name, auto) = {
                         let s = i.sessions.get(&id).unwrap();
@@ -478,7 +494,8 @@ impl GatewayState {
                         // only the SSH tunnel needs to be respawned.
                         if let Some(session) = i.sessions.get_mut(&id) {
                             session.phase = Phase::Reconnecting;
-                            to_reconnect.push(session.profile.clone());
+                            to_reconnect.push((session.profile.clone(), had_terminal));
+                            i.reconnecting.insert(id.clone());
                         }
                         i.logs.push(format!("[{name}] 将自动重连…"));
                     } else if let Some(session) = i.sessions.remove(&id) {
@@ -489,20 +506,21 @@ impl GatewayState {
             }
         });
 
-        for profile in to_reconnect {
+        for (profile, reopen_terminal) in to_reconnect {
             thread::sleep(Duration::from_secs(2));
-            if let Err(e) = self.reconnect_one(profile.clone()) {
-                self.with_inner(|i| {
-                    i.logs
-                        .push(format!("[{}] 重连失败: {e}", profile.name));
-                });
-            }
+            let result = self.reconnect_one(profile.clone(), reopen_terminal);
+            self.with_inner(|i| {
+                i.reconnecting.remove(&profile.id);
+                if let Err(e) = &result {
+                    i.logs.push(format!("[{}] 重连失败: {e}", profile.name));
+                }
+            });
         }
 
         Ok(self.status())
     }
 
-    fn reconnect_one(&self, profile: GatewayProfile) -> Result<(), String> {
+    fn reconnect_one(&self, profile: GatewayProfile, reopen_terminal: bool) -> Result<(), String> {
         let id = profile.id.clone();
 
         // The session (and its dedicated local proxy) is kept alive by
@@ -517,14 +535,33 @@ impl GatewayState {
 
         let tunnel = SshTunnel::spawn(&profile, local_http, local_socks, logs)?;
 
-        self.with_inner(|i| {
+        let (app, terminals) = self.with_inner(|i| {
             if let Some(session) = i.sessions.get_mut(&id) {
                 session.tunnel = tunnel;
                 session.phase = Phase::Connected;
                 session.last_error = None;
             }
             i.logs.push(format!("[{}] 重连成功", profile.name));
+            (i.app.clone(), i.terminals.clone())
         });
+
+        // The terminal's ssh process was killed along with the dead tunnel; bring it back
+        // so the still-mounted tab becomes usable again instead of staying frozen. The
+        // event tells the frontend to reset its xterm buffer and re-arm the `outgate on`
+        // injection for the fresh shell.
+        if reopen_terminal {
+            match terminals.open(app.clone(), &profile) {
+                // Emitted only once the new PTY exists, so the resize the frontend sends
+                // back in response lands on the live session instead of being rejected.
+                Ok(()) => {
+                    let _ = app.emit(&format!("terminal-reconnect-{id}"), ());
+                }
+                Err(e) => self.with_inner(|i| {
+                    i.logs
+                        .push(format!("[{}] 重连后恢复终端失败: {e}", profile.name));
+                }),
+            }
+        }
         Ok(())
     }
 

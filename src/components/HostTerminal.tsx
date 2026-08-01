@@ -51,20 +51,18 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
         console.warn(`Failed to inject OutGate environment for profile ${profileId}`, error);
       });
     };
-    const injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
-
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
+    let injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
+    const unlisteners: Array<() => void> = [];
+    const track = (fn: () => void) => {
+      if (cancelled) fn();
+      else unlisteners.push(fn);
+    };
+
     listen<string>(`terminal-output-${profileId}`, (event) => {
       term.write(event.payload);
       injectOnce();
-    }).then((fn) => {
-      if (cancelled) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
+    }).then(track);
 
     const dataDisposable = term.onData((data) => {
       invoke("gateway_terminal_write", { profileId, data }).catch(() => {});
@@ -86,12 +84,25 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     resizeObserver.observe(container);
     sendResize();
 
+    // Auto-reconnect kills the terminal's ssh process along with the dead tunnel and
+    // spawns a fresh one behind the same tab. Clear the stale buffer, re-send the real
+    // geometry (the new PTY starts at the default 80x24) and re-arm the injection so the
+    // new login shell gets `outgate on` too.
+    listen(`terminal-reconnect-${profileId}`, () => {
+      term.reset();
+      term.writeln("\x1b[2m— 隧道已重连，终端会话已重建 —\x1b[0m");
+      injectedRef.current = false;
+      window.clearTimeout(injectTimer);
+      injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
+      sendResize();
+    }).then(track);
+
     return () => {
       cancelled = true;
       window.clearTimeout(injectTimer);
       resizeObserver.disconnect();
       dataDisposable.dispose();
-      unlisten?.();
+      unlisteners.forEach((fn) => fn());
       term.dispose();
     };
   }, [profileId]);

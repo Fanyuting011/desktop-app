@@ -165,12 +165,18 @@ impl TerminalHub {
     }
 
     /// Kill the ssh child (if any) for this profile and drop its PTY handles. Safe to
-    /// call for a profile with no open terminal (no-op).
-    pub fn close(&self, profile_id: &str) {
+    /// call for a profile with no open terminal (no-op). Returns whether a terminal was
+    /// actually open, so callers tearing one down implicitly (e.g. a dead tunnel about
+    /// to auto-reconnect) know whether to reopen it afterwards.
+    pub fn close(&self, profile_id: &str) -> bool {
         let mut sessions = self.sessions.lock().expect("terminal hub poisoned");
-        if let Some(mut session) = sessions.remove(profile_id) {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
+        match sessions.remove(profile_id) {
+            Some(mut session) => {
+                let _ = session.child.kill();
+                let _ = session.child.wait();
+                true
+            }
+            None => false,
         }
     }
 }
