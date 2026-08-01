@@ -1005,7 +1005,11 @@ fn deploy_outgate_cli(profile: &GatewayProfile, logs: Arc<LogBuffer>) -> Result<
         "[{}] 部署 OutGate CLI → ~/.outgate/bin",
         profile.name
     ));
-    let b64 = base64_encode_local(OUTGATE_CLI.as_bytes());
+    // Windows checkouts often convert scripts to CRLF; remote bash then sees
+    // `set -o pipefail\r` and fails with "invalid option name". Always ship LF.
+    let cli = normalize_shell_script(OUTGATE_CLI);
+    let deploy = normalize_shell_script(DEPLOY_SCRIPT);
+    let b64 = base64_encode_local(cli.as_bytes());
     let http = format!("http://127.0.0.1:{}", profile.remote_http_port);
     let socks = format!("socks5h://127.0.0.1:{}", profile.remote_socks_port);
     let no_proxy = profile.no_proxy.join(",");
@@ -1015,8 +1019,13 @@ fn deploy_outgate_cli(profile: &GatewayProfile, logs: Arc<LogBuffer>) -> Result<
         ("OUTGATE_SOCKS", socks),
         ("OUTGATE_NO_PROXY", no_proxy),
     ];
-    remote_run_script(profile, DEPLOY_SCRIPT, &env, logs)?;
+    remote_run_script(profile, &deploy, &env, logs)?;
     Ok(())
+}
+
+/// Strip CR so embedded shell scripts stay valid when the working tree uses CRLF.
+fn normalize_shell_script(script: &str) -> String {
+    script.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn base64_encode_local(data: &[u8]) -> String {
@@ -1044,4 +1053,20 @@ fn base64_encode_local(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod script_normalize_tests {
+    use super::normalize_shell_script;
+
+    #[test]
+    fn strips_crlf_so_pipefail_stays_valid() {
+        let raw = "set -euo pipefail\r\necho ok\r\n";
+        assert_eq!(normalize_shell_script(raw), "set -euo pipefail\necho ok\n");
+    }
+
+    #[test]
+    fn strips_bare_cr() {
+        assert_eq!(normalize_shell_script("a\rb\n"), "a\nb\n");
+    }
 }

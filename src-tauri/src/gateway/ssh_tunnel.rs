@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use super::askpass::AskpassEnv;
 use super::log_buffer::LogBuffer;
 use super::profiles::GatewayProfile;
-use super::ssh_bin::resolve_ssh_bin;
+use super::ssh_bin::{hide_console_window, resolve_ssh_bin};
 
 pub struct SshTunnel {
     child: Child,
@@ -128,6 +128,7 @@ fn base_ssh_cmd(
     askpass: Option<&AskpassEnv>,
 ) -> Result<Command, String> {
     let mut cmd = Command::new(resolve_ssh_bin()?);
+    hide_console_window(&mut cmd);
     for arg in ssh_common_args(profile) {
         cmd.arg(arg);
     }

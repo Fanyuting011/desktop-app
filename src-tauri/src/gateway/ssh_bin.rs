@@ -3,6 +3,20 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Hide the console window that Windows otherwise flashes for every `ssh`/`scp`/`where`
+/// child process spawned from a GUI (Tauri) app.
+pub fn hide_console_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 pub fn resolve_ssh_bin() -> Result<PathBuf, String> {
     resolve_bin("ssh", ssh_candidates())
 }
@@ -27,13 +41,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    use std::os::windows::process::CommandExt;
-
-    let output = Command::new("where")
-        .arg(name)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut command = Command::new("where");
+    command.arg(name);
+    hide_console_window(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

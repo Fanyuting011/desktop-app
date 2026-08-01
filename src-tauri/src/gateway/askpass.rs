@@ -29,11 +29,10 @@ impl AskpassEnv {
         #[cfg(windows)]
         let script_path = {
             let path = dir.join("askpass.cmd");
-            // Read password file and print without trailing spaces; keep exact password bytes as UTF-8 text.
+            // Avoid PowerShell here — each ASKPASS invocation would flash a console window
+            // during connect (auth probe, tunnel, deploy, cleanup). `type` is enough.
             let pf = password_file.display().to_string().replace('/', "\\");
-            let content = format!(
-                "@echo off\r\npowershell -NoProfile -Command \"[IO.File]::ReadAllText('{pf}').TrimEnd([char]13,[char]10)\"\r\n"
-            );
+            let content = format!("@echo off\r\ntype \"{pf}\"\r\n");
             fs::write(&path, content).map_err(|e| format!("写入 askpass 脚本失败: {e}"))?;
             path
         };

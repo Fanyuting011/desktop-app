@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::profiles::GatewayProfile;
-use super::ssh_bin::resolve_scp_bin;
+use super::ssh_bin::{hide_console_window, resolve_scp_bin};
 use super::ssh_tunnel::prepare_askpass;
 
 pub fn scp_upload_args(
@@ -86,6 +86,7 @@ fn remote_target(profile: &GatewayProfile, remote: &str) -> String {
 fn run_scp(profile: &GatewayProfile, bin: PathBuf, args: Vec<String>) -> Result<(), String> {
     let askpass = prepare_askpass(profile)?;
     let mut command = Command::new(bin);
+    hide_console_window(&mut command);
     command
         .args(&args)
         .stdin(Stdio::null())
