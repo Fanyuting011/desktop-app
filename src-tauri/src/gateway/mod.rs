@@ -1,5 +1,6 @@
 mod askpass;
 mod log_buffer;
+mod port_alloc;
 pub mod manager;
 mod profiles;
 mod proxy;
