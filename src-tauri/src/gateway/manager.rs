@@ -80,8 +80,27 @@ struct Inner {
     logs: Arc<LogBuffer>,
     network_logs: Arc<NetworkLogBuffer>,
     sessions: HashMap<String, LiveSession>,
+    /// Profile ids with a `connect()` in flight — guards against a second concurrent
+    /// `connect()` for the same host starting a duplicate proxy/tunnel before the first
+    /// one has inserted its session (see `PendingGuard`).
+    pending: HashSet<String>,
     upstream: Option<UpstreamKind>,
     runtime: Option<tokio::runtime::Runtime>,
+}
+
+/// RAII guard that removes a profile id from `Inner::pending` once `connect()` finishes,
+/// whether it succeeds or bails out early (error return, `?`, panic-free early return, etc).
+struct PendingGuard {
+    state: GatewayState,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.state.with_inner(|i| {
+            i.pending.remove(&self.id);
+        });
+    }
 }
 
 impl GatewayState {
@@ -101,6 +120,7 @@ impl GatewayState {
                 logs: Arc::new(LogBuffer::new()),
                 network_logs: Arc::new(NetworkLogBuffer::new()),
                 sessions: HashMap::new(),
+                pending: HashSet::new(),
                 upstream: None,
                 runtime,
             })),
@@ -197,8 +217,11 @@ impl GatewayState {
             let id = profile_id
                 .or_else(|| i.profiles.active_id())
                 .ok_or_else(|| "请先选择服务器".to_string())?;
-            if i.sessions.contains_key(&id) {
-                return Err("该主机已连接".to_string());
+            // Check-and-reserve under a single lock: `sessions` catches an already-connected
+            // host, `pending` catches a second concurrent `connect()` for the same host that
+            // hasn't inserted its session yet (both must be checked before either is set).
+            if i.sessions.contains_key(&id) || i.pending.contains(&id) {
+                return Err("该主机已连接或正在连接中".to_string());
             }
             let profile = i
                 .profiles
@@ -208,9 +231,18 @@ impl GatewayState {
             if i.runtime.is_none() {
                 return Err("Tokio runtime 不可用".to_string());
             }
-            let _ = i.profiles.set_active(Some(id));
+            let _ = i.profiles.set_active(Some(id.clone()));
+            i.pending.insert(id);
             Ok((profile, i.logs.clone()))
         })?;
+
+        // Held for the remainder of this call so that any early return (error or success)
+        // releases the `pending` reservation exactly once, including proxy/tunnel cleanup
+        // paths below that run before the session is actually inserted.
+        let _pending_guard = PendingGuard {
+            state: self.clone(),
+            id: profile.id.clone(),
+        };
 
         // Allocate a dedicated local proxy for this session and start it.
         let (proxy, local_http, local_socks) = {
