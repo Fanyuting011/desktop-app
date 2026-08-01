@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager};
 
 use super::log_buffer::LogBuffer;
 use super::network_log::NetworkLogBuffer;
+use super::port_alloc::allocate_port_pair;
 use super::profiles::{GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
 use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
@@ -16,9 +17,11 @@ use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
 const OUTGATE_CLI: &str = include_str!("../../../scripts/server/outgate");
 const DEPLOY_SCRIPT: &str = include_str!("../../../scripts/server/deploy-outgate.sh");
 
-/// Shared local proxy ports (one listener; many SSH -R tunnels).
-const SHARED_LOCAL_HTTP: u16 = 17890;
-const SHARED_LOCAL_SOCKS: u16 = 17891;
+/// Base port for per-session local proxy allocation (each host session gets its own pair).
+const DEFAULT_BASE_HTTP_PORT: u16 = 17890;
+
+/// Placeholder shown when no session is connected under the active profile.
+const NO_PROXY_PLACEHOLDER: &str = "未连接";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +38,8 @@ pub struct SessionInfo {
     pub profile_id: String,
     pub phase: Phase,
     pub last_error: Option<String>,
+    pub local_http_port: u16,
+    pub local_socks_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +55,10 @@ pub struct GatewayStatus {
 struct LiveSession {
     profile: GatewayProfile,
     tunnel: SshTunnel,
+    /// Dedicated local proxy for this host — each session binds its own ports.
+    proxy: ProxyHandles,
+    local_http: u16,
+    local_socks: u16,
     phase: Phase,
     last_error: Option<String>,
 }
@@ -71,9 +80,6 @@ struct Inner {
     logs: Arc<LogBuffer>,
     network_logs: Arc<NetworkLogBuffer>,
     sessions: HashMap<String, LiveSession>,
-    /// Connect/reconnect in flight — keeps shared proxy alive before session is inserted.
-    connecting: usize,
-    shared_proxy: Option<ProxyHandles>,
     upstream: Option<UpstreamKind>,
     runtime: Option<tokio::runtime::Runtime>,
 }
@@ -95,8 +101,6 @@ impl GatewayState {
                 logs: Arc::new(LogBuffer::new()),
                 network_logs: Arc::new(NetworkLogBuffer::new()),
                 sessions: HashMap::new(),
-                connecting: 0,
-                shared_proxy: None,
                 upstream: None,
                 runtime,
             })),
@@ -146,19 +150,28 @@ impl GatewayState {
                     profile_id: id.clone(),
                     phase: s.phase,
                     last_error: s.last_error.clone(),
+                    local_http_port: s.local_http,
+                    local_socks_port: s.local_socks,
                 })
                 .collect();
-            let (local_http, local_socks) = if let Some(ref p) = i.shared_proxy {
-                (
-                    format!("http://{}", p.http_addr),
-                    format!("socks5h://{}", p.socks_addr),
-                )
-            } else {
-                (
-                    format!("http://127.0.0.1:{SHARED_LOCAL_HTTP}"),
-                    format!("socks5h://127.0.0.1:{SHARED_LOCAL_SOCKS}"),
-                )
-            };
+            // Each host session owns its own local proxy ports; surface the active
+            // profile's ports here (falls back to a placeholder when nothing is connected).
+            let (local_http, local_socks) = i
+                .profiles
+                .active_id()
+                .and_then(|id| i.sessions.get(&id))
+                .map(|s| {
+                    (
+                        format!("http://127.0.0.1:{}", s.local_http),
+                        format!("socks5h://127.0.0.1:{}", s.local_socks),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        NO_PROXY_PLACEHOLDER.to_string(),
+                        NO_PROXY_PLACEHOLDER.to_string(),
+                    )
+                });
             GatewayStatus {
                 active_profile_id: i.profiles.active_id(),
                 sessions,
@@ -199,53 +212,62 @@ impl GatewayState {
             Ok((profile, i.logs.clone()))
         })?;
 
-        // Ensure shared local proxy (hold prevents poll from stopping it mid-connect).
-        {
+        // Allocate a dedicated local proxy for this session and start it.
+        let (proxy, local_http, local_socks) = {
             let mut i = self.inner.lock().expect("poisoned");
-            i.connecting += 1;
             i.logs.push(format!(
                 "连接服务器 {}@{}:{} ({})",
                 profile.user, profile.host, profile.port, profile.name
             ));
-            if i.shared_proxy.is_none() {
+            if i.sessions.is_empty() {
                 if let Some(ref up) = upstream {
-                    i.logs
-                        .push(format!("启动共享本地代理，上游 {}", up.display()));
-                    i.upstream = Some(up.clone());
+                    i.logs.push(format!("启动本地代理，上游 {}", up.display()));
                 } else {
-                    i.logs.push("启动共享本地代理（直连公网）".to_string());
-                    i.upstream = None;
+                    i.logs.push("启动本地代理（直连公网）".to_string());
                 }
-                if i.runtime.is_none() {
-                    i.connecting = i.connecting.saturating_sub(1);
-                    return Err("Tokio runtime 不可用".to_string());
-                }
-                let proxy = match i.runtime.as_ref().unwrap().block_on(start_local_proxies(
-                    SHARED_LOCAL_HTTP,
-                    SHARED_LOCAL_SOCKS,
-                    upstream.clone(),
-                    profile.id.clone(),
-                    i.network_logs.clone(),
-                )) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        i.logs.push(format!("连接失败: {e}"));
-                        i.connecting = i.connecting.saturating_sub(1);
-                        return Err(e);
-                    }
-                };
-                i.logs
-                    .push(format!("本地代理已监听 {}", proxy.http_addr));
-                i.shared_proxy = Some(proxy);
+                i.upstream = upstream.clone();
             } else if upstream.is_some()
                 && i.upstream.as_ref().map(|u| u.display())
                     != upstream.as_ref().map(|u| u.display())
             {
-                i.logs.push(
-                    "提示: 共享代理已在运行，本次连接沿用现有上游设置".to_string(),
-                );
+                i.logs
+                    .push("提示: 已有主机连接中，本次连接沿用现有上游设置".to_string());
             }
-        }
+
+            let used = collect_used_ports(&i.sessions);
+            let (local_http, local_socks) = match allocate_port_pair(&used, DEFAULT_BASE_HTTP_PORT)
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    i.logs.push(format!("连接失败: {e}"));
+                    return Err(e);
+                }
+            };
+
+            if i.runtime.is_none() {
+                return Err("Tokio runtime 不可用".to_string());
+            }
+            let resolved_upstream = i.upstream.clone();
+            let net_log = i.network_logs.clone();
+            let proxy = match i.runtime.as_ref().unwrap().block_on(start_local_proxies(
+                local_http,
+                local_socks,
+                resolved_upstream,
+                profile.id.clone(),
+                net_log,
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    i.logs.push(format!("连接失败: {e}"));
+                    return Err(e);
+                }
+            };
+            i.logs.push(format!(
+                "[{}] 本地代理已监听 {}",
+                profile.name, proxy.http_addr
+            ));
+            (proxy, local_http, local_socks)
+        };
 
         let tunnel_result = (|| {
             let _ = cleanup_remote_listen_ports(
@@ -255,12 +277,7 @@ impl GatewayState {
                 logs.clone(),
             );
 
-            match SshTunnel::spawn(
-                &profile,
-                SHARED_LOCAL_HTTP,
-                SHARED_LOCAL_SOCKS,
-                logs.clone(),
-            ) {
+            match SshTunnel::spawn(&profile, local_http, local_socks, logs.clone()) {
                 Ok(t) => Ok(t),
                 Err(e)
                     if e.contains("remote port forwarding failed") || e.contains("listen port") =>
@@ -276,12 +293,7 @@ impl GatewayState {
                         logs.clone(),
                     );
                     thread::sleep(Duration::from_millis(500));
-                    SshTunnel::spawn(
-                        &profile,
-                        SHARED_LOCAL_HTTP,
-                        SHARED_LOCAL_SOCKS,
-                        logs.clone(),
-                    )
+                    SshTunnel::spawn(&profile, local_http, local_socks, logs.clone())
                 }
                 Err(e) => Err(e),
             }
@@ -290,10 +302,9 @@ impl GatewayState {
         let tunnel = match tunnel_result {
             Ok(t) => t,
             Err(e) => {
+                proxy.stop();
                 self.with_inner(|i| {
                     i.logs.push(format!("连接失败 [{}]: {e}", profile.name));
-                    i.connecting = i.connecting.saturating_sub(1);
-                    self_stop_proxy_if_empty(&mut *i);
                 });
                 return Err(e);
             }
@@ -306,13 +317,17 @@ impl GatewayState {
                 LiveSession {
                     profile: profile.clone(),
                     tunnel,
+                    proxy,
+                    local_http,
+                    local_socks,
                     phase: Phase::Connected,
                     last_error: None,
                 },
             );
-            i.connecting = i.connecting.saturating_sub(1);
-            i.logs
-                .push(format!("SSH 隧道已建立 [{}]（可同时连接多台）", profile.name));
+            i.logs.push(format!(
+                "SSH 隧道已建立 [{}]（本地端口 {local_http}/{local_socks}，可同时连接多台）",
+                profile.name
+            ));
         });
 
         if let Err(e) = deploy_outgate_cli(&profile, logs) {
@@ -348,10 +363,10 @@ impl GatewayState {
         self.with_inner(|i| {
             if let Some(mut session) = i.sessions.remove(&id) {
                 session.tunnel.kill();
+                session.proxy.stop();
                 i.logs
                     .push(format!("已断开 [{}]", session.profile.name));
             }
-            self_stop_proxy_if_empty(&mut *i);
         });
 
         let logs2 = self.with_inner(|i| i.logs.clone());
@@ -389,17 +404,19 @@ impl GatewayState {
                         (s.profile.name.clone(), s.profile.auto_reconnect)
                     };
                     if auto {
+                        // Keep the session (and its local proxy) alive across reconnect —
+                        // only the SSH tunnel needs to be respawned.
                         if let Some(session) = i.sessions.get_mut(&id) {
                             session.phase = Phase::Reconnecting;
                             to_reconnect.push(session.profile.clone());
                         }
                         i.logs.push(format!("[{name}] 将自动重连…"));
-                    } else {
-                        i.sessions.remove(&id);
+                    } else if let Some(session) = i.sessions.remove(&id) {
+                        session.proxy.stop();
+                        i.logs.push(format!("[{name}] 已停止本地代理"));
                     }
                 }
             }
-            self_stop_proxy_if_empty(&mut *i);
         });
 
         for profile in to_reconnect {
@@ -416,61 +433,27 @@ impl GatewayState {
     }
 
     fn reconnect_one(&self, profile: GatewayProfile) -> Result<(), String> {
-        let logs = self.with_inner(|i| {
-            i.connecting += 1;
-            if i.shared_proxy.is_none() {
-                let upstream = i.upstream.clone();
-                if i.runtime.is_none() {
-                    i.connecting = i.connecting.saturating_sub(1);
-                    return Err("Tokio runtime 不可用".to_string());
-                }
-                let proxy = match i.runtime.as_ref().unwrap().block_on(start_local_proxies(
-                    SHARED_LOCAL_HTTP,
-                    SHARED_LOCAL_SOCKS,
-                    upstream,
-                    profile.id.clone(),
-                    i.network_logs.clone(),
-                )) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        i.connecting = i.connecting.saturating_sub(1);
-                        return Err(e);
-                    }
-                };
-                i.shared_proxy.replace(proxy);
-            }
-            Ok::<_, String>(i.logs.clone())
+        let id = profile.id.clone();
+
+        // The session (and its dedicated local proxy) is kept alive by
+        // `poll_and_maybe_reconnect` across a dead tunnel, so we just reuse its
+        // existing ports here — no need to touch (or risk killing) any proxy.
+        let (local_http, local_socks, logs) = self.with_inner(|i| {
+            i.sessions
+                .get(&id)
+                .map(|s| (s.local_http, s.local_socks, i.logs.clone()))
+                .ok_or_else(|| "会话已丢失，无法重连".to_string())
         })?;
 
-        let tunnel = match SshTunnel::spawn(
-            &profile,
-            SHARED_LOCAL_HTTP,
-            SHARED_LOCAL_SOCKS,
-            logs,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                self.with_inner(|i| {
-                    i.connecting = i.connecting.saturating_sub(1);
-                    self_stop_proxy_if_empty(&mut *i);
-                });
-                return Err(e);
-            }
-        };
+        let tunnel = SshTunnel::spawn(&profile, local_http, local_socks, logs)?;
 
         self.with_inner(|i| {
-            let name = profile.name.clone();
-            i.sessions.insert(
-                profile.id.clone(),
-                LiveSession {
-                    profile,
-                    tunnel,
-                    phase: Phase::Connected,
-                    last_error: None,
-                },
-            );
-            i.connecting = i.connecting.saturating_sub(1);
-            i.logs.push(format!("[{name}] 重连成功"));
+            if let Some(session) = i.sessions.get_mut(&id) {
+                session.tunnel = tunnel;
+                session.phase = Phase::Connected;
+                session.last_error = None;
+            }
+            i.logs.push(format!("[{}] 重连成功", profile.name));
         });
         Ok(())
     }
@@ -492,13 +475,13 @@ impl GatewayState {
     }
 }
 
-fn self_stop_proxy_if_empty(i: &mut Inner) {
-    if i.sessions.is_empty() && i.connecting == 0 {
-        if let Some(proxy) = i.shared_proxy.take() {
-            proxy.stop();
-            i.logs.push("所有隧道已断开，已停止本地代理".to_string());
-        }
+fn collect_used_ports(sessions: &HashMap<String, LiveSession>) -> HashSet<u16> {
+    let mut used = HashSet::new();
+    for s in sessions.values() {
+        used.insert(s.local_http);
+        used.insert(s.local_socks);
     }
+    used
 }
 
 fn cleanup_remote_listen_ports(

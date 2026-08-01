@@ -49,16 +49,23 @@ mod tests {
 
     #[test]
     fn skips_ports_already_bound() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let busy = listener.local_addr().unwrap().port();
-        // Force allocator to consider a range that includes busy by using busy as base when even
-        let base = if busy % 2 == 0 {
-            busy
-        } else {
-            busy.saturating_sub(1)
-        };
-        let mut used = HashSet::new();
+        // Hold a low, well-within-range port pair busy with real listeners (rather than
+        // relying on an OS-assigned ephemeral port, which can land near the u16 range ceiling
+        // and make the allocator's bounded search flaky) and confirm the allocator steps past
+        // both of them. Try a few candidate bases in case the default pair is already occupied
+        // by another process on this machine (e.g. a running dev build of this app).
+        let candidates = [17890u16, 27890, 37890, 47890, 57890];
+        let bound = candidates.into_iter().find_map(|base| {
+            let http = TcpListener::bind(("127.0.0.1", base)).ok()?;
+            let socks = TcpListener::bind(("127.0.0.1", base + 1)).ok()?;
+            Some((base, http, socks))
+        });
+        let (base, _http_listener, _socks_listener) =
+            bound.expect("could not find a free port pair to hold busy for the test");
+
+        let used = HashSet::new();
         let (h, s) = allocate_port_pair(&used, base).unwrap();
-        assert!(h != busy && s != busy);
+        assert!(h != base && s != base);
+        assert!(h != base + 1 && s != base + 1);
     }
 }
