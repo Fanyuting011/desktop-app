@@ -257,7 +257,12 @@ export default function App() {
         enabled: !presetEnabled(draft, port),
       });
       setStatus(st);
-      await refresh();
+      const plist = await invoke<GatewayProfile[]>("gateway_list_profiles");
+      setProfiles(plist);
+      setDraft((prev) => {
+        const latest = plist.find((profile) => profile.id === prev?.id);
+        return latest && prev ? { ...prev, portForwards: latest.portForwards } : prev;
+      });
     } catch (e) {
       setMessage(String(e));
     } finally {

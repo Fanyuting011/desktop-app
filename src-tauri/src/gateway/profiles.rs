@@ -106,7 +106,7 @@ pub fn apply_preset(forwards: &mut Vec<PortForwardRule>, port: u16, enabled: boo
     let rule = forwards.iter_mut().find(|rule| {
         is_loopback(&rule.local_host)
             && rule.local_port == port
-            && rule.remote_host == "127.0.0.1"
+            && matches!(rule.remote_host.as_str(), "127.0.0.1" | "localhost")
             && rule.remote_port == port
     });
 
@@ -257,6 +257,17 @@ mod tests {
 
         apply_preset(&mut forwards, 3000, false);
         assert_eq!(forwards.len(), 1);
+        assert!(!forwards[0].enabled);
+    }
+
+    #[test]
+    fn apply_preset_disables_localhost_remote_rule() {
+        let mut forwards = vec![PortForwardRule {
+            remote_host: "localhost".into(),
+            ..GatewayProfile::preset_forward(8080)
+        }];
+
+        assert!(apply_preset(&mut forwards, 8080, false));
         assert!(!forwards[0].enabled);
     }
 
