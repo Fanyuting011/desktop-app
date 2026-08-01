@@ -102,7 +102,7 @@ impl GatewayProfile {
     }
 }
 
-pub fn apply_preset(forwards: &mut Vec<PortForwardRule>, port: u16, enabled: bool) {
+pub fn apply_preset(forwards: &mut Vec<PortForwardRule>, port: u16, enabled: bool) -> bool {
     let rule = forwards.iter_mut().find(|rule| {
         is_loopback(&rule.local_host)
             && rule.local_port == port
@@ -111,9 +111,16 @@ pub fn apply_preset(forwards: &mut Vec<PortForwardRule>, port: u16, enabled: boo
     });
 
     match rule {
-        Some(rule) => rule.enabled = enabled,
-        None if enabled => forwards.push(GatewayProfile::preset_forward(port)),
-        None => {}
+        Some(rule) if rule.enabled != enabled => {
+            rule.enabled = enabled;
+            true
+        }
+        Some(_) => false,
+        None if enabled => {
+            forwards.push(GatewayProfile::preset_forward(port));
+            true
+        }
+        None => false,
     }
 }
 
@@ -257,8 +264,17 @@ mod tests {
     fn apply_preset_leaves_missing_disabled_rule_absent() {
         let mut forwards = vec![];
 
-        apply_preset(&mut forwards, 8080, false);
+        assert!(!apply_preset(&mut forwards, 8080, false));
 
         assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn apply_preset_returns_false_when_rule_already_has_requested_state() {
+        let mut forwards = vec![GatewayProfile::preset_forward(5432)];
+
+        assert!(!apply_preset(&mut forwards, 5432, true));
+        assert!(apply_preset(&mut forwards, 5432, false));
+        assert!(!apply_preset(&mut forwards, 5432, false));
     }
 }

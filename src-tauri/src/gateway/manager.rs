@@ -60,6 +60,8 @@ struct LiveSession {
     proxy: ProxyHandles,
     local_http: u16,
     local_socks: u16,
+    /// Monotonic session token used to discard stale tunnel spawn completions.
+    generation: u64,
     phase: Phase,
     last_error: Option<String>,
 }
@@ -91,7 +93,10 @@ struct Inner {
     /// Profile ids whose tunnel is currently being respawned by `reconnect_one`. A dead
     /// tunnel keeps reporting dead from `try_wait()` until it is replaced, so without this
     /// guard every 3s poll would enqueue yet another reconnect on top of the in-flight one.
-    reconnecting: HashSet<String>,
+    reconnecting: HashMap<String, u64>,
+    /// Never reset across disconnect/reconnect, so a stale task cannot match a new session
+    /// that reuses the same profile id.
+    next_generation: u64,
     upstream: Option<UpstreamKind>,
     runtime: Option<tokio::runtime::Runtime>,
     /// Interactive PTY-backed `ssh` sessions for the embedded terminal — independent of
@@ -135,7 +140,8 @@ impl GatewayState {
                 network_logs: Arc::new(NetworkLogBuffer::new()),
                 sessions: HashMap::new(),
                 pending: HashSet::new(),
-                reconnecting: HashSet::new(),
+                reconnecting: HashMap::new(),
+                next_generation: 0,
                 upstream: None,
                 runtime,
                 terminals: Arc::new(TerminalHub::new()),
@@ -379,6 +385,9 @@ impl GatewayState {
 
         let id = profile.id.clone();
         self.with_inner(|i| {
+            i.next_generation += 1;
+            let generation = i.next_generation;
+            i.reconnecting.remove(&id);
             i.sessions.insert(
                 id.clone(),
                 LiveSession {
@@ -387,6 +396,7 @@ impl GatewayState {
                     proxy,
                     local_http,
                     local_socks,
+                    generation,
                     phase: Phase::Connected,
                     last_error: None,
                 },
@@ -439,6 +449,7 @@ impl GatewayState {
                 i.logs
                     .push(format!("已断开 [{}]", session.profile.name));
             }
+            i.reconnecting.remove(&id);
         });
 
         let logs2 = self.with_inner(|i| i.logs.clone());
@@ -448,8 +459,8 @@ impl GatewayState {
     }
 
     pub fn poll_and_maybe_reconnect(&self) -> Result<GatewayStatus, String> {
-        // (profile, whether an interactive terminal was open before the tunnel died)
-        let mut to_reconnect: Vec<(GatewayProfile, bool)> = Vec::new();
+        // (profile id, generation, whether an interactive terminal was open before the tunnel died)
+        let mut to_reconnect: Vec<(String, u64, bool)> = Vec::new();
 
         self.with_inner(|i| {
             let ids: Vec<String> = i.sessions.keys().cloned().collect();
@@ -457,7 +468,7 @@ impl GatewayState {
                 // A reconnect already in flight owns this session's tunnel: its old handle
                 // still reports dead, so re-running the dead path here would kill the
                 // terminal again and queue duplicate reconnects.
-                if i.reconnecting.contains(&id) {
+                if i.reconnecting.contains_key(&id) {
                     continue;
                 }
                 let dead = {
@@ -492,10 +503,13 @@ impl GatewayState {
                     if auto {
                         // Keep the session (and its local proxy) alive across reconnect —
                         // only the SSH tunnel needs to be respawned.
+                        i.next_generation += 1;
+                        let generation = i.next_generation;
                         if let Some(session) = i.sessions.get_mut(&id) {
                             session.phase = Phase::Reconnecting;
-                            to_reconnect.push((session.profile.clone(), had_terminal));
-                            i.reconnecting.insert(id.clone());
+                            session.generation = generation;
+                            to_reconnect.push((id.clone(), generation, had_terminal));
+                            i.reconnecting.insert(id.clone(), generation);
                         }
                         i.logs.push(format!("[{name}] 将自动重连…"));
                     } else if let Some(session) = i.sessions.remove(&id) {
@@ -506,13 +520,15 @@ impl GatewayState {
             }
         });
 
-        for (profile, reopen_terminal) in to_reconnect {
+        for (profile_id, generation, reopen_terminal) in to_reconnect {
             thread::sleep(Duration::from_secs(2));
-            let result = self.reconnect_one(profile.clone(), reopen_terminal);
+            let result = self.reconnect_one(profile_id.clone(), generation, reopen_terminal);
             self.with_inner(|i| {
-                i.reconnecting.remove(&profile.id);
+                if i.reconnecting.get(&profile_id) == Some(&generation) {
+                    i.reconnecting.remove(&profile_id);
+                }
                 if let Err(e) = &result {
-                    i.logs.push(format!("[{}] 重连失败: {e}", profile.name));
+                    i.logs.push(format!("[{profile_id}] 重连失败: {e}"));
                 }
             });
         }
@@ -520,30 +536,51 @@ impl GatewayState {
         Ok(self.status())
     }
 
-    fn reconnect_one(&self, profile: GatewayProfile, reopen_terminal: bool) -> Result<(), String> {
-        let id = profile.id.clone();
-
-        // The session (and its dedicated local proxy) is kept alive by
-        // `poll_and_maybe_reconnect` across a dead tunnel, so we just reuse its
-        // existing ports here — no need to touch (or risk killing) any proxy.
-        let (local_http, local_socks, logs) = self.with_inner(|i| {
-            i.sessions
+    fn reconnect_one(
+        &self,
+        id: String,
+        generation: u64,
+        reopen_terminal: bool,
+    ) -> Result<(), String> {
+        // Fetch the profile only after checking the generation so a preset update cannot
+        // make this reconnect spawn with an obsolete captured profile.
+        let (profile, local_http, local_socks, logs) = self.with_inner(|i| {
+            let session = i
+                .sessions
                 .get(&id)
-                .map(|s| (s.local_http, s.local_socks, i.logs.clone()))
-                .ok_or_else(|| "会话已丢失，无法重连".to_string())
+                .ok_or_else(|| "会话已丢失，无法重连".to_string())?;
+            if session.generation != generation {
+                return Err("重连任务已过期".to_string());
+            }
+            Ok::<_, String>((
+                session.profile.clone(),
+                session.local_http,
+                session.local_socks,
+                i.logs.clone(),
+            ))
         })?;
 
-        let tunnel = SshTunnel::spawn(&profile, local_http, local_socks, logs)?;
+        let mut tunnel = Some(SshTunnel::spawn(&profile, local_http, local_socks, logs)?);
 
-        let (app, terminals) = self.with_inner(|i| {
-            if let Some(session) = i.sessions.get_mut(&id) {
-                session.tunnel = tunnel;
-                session.phase = Phase::Connected;
-                session.last_error = None;
+        let install = self.with_inner(|i| {
+            let Some(session) = i.sessions.get_mut(&id) else {
+                return None;
+            };
+            if session.generation != generation {
+                return None;
             }
+            session.tunnel = tunnel.take().expect("tunnel is available for installation");
+            session.phase = Phase::Connected;
+            session.last_error = None;
             i.logs.push(format!("[{}] 重连成功", profile.name));
-            (i.app.clone(), i.terminals.clone())
+            Some((i.app.clone(), i.terminals.clone()))
         });
+        let Some((app, terminals)) = install else {
+            if let Some(mut tunnel) = tunnel {
+                tunnel.kill();
+            }
+            return Err("重连任务已过期或会话已断开".to_string());
+        };
 
         // The terminal's ssh process was killed along with the dead tunnel; bring it back
         // so the still-mounted tab becomes usable again instead of staying frozen. The
@@ -591,61 +628,115 @@ impl GatewayState {
             return Err(format!("不支持端口 {port}；仅支持 3000、8080、5432"));
         }
 
-        let (profile, should_respawn) = self.with_inner(|i| {
+        let (profile, respawn_generation) = self.with_inner(|i| {
             let mut profile = i
                 .profiles
                 .get(&profile_id)
                 .ok_or_else(|| "配置不存在".to_string())?;
-            apply_preset(&mut profile.port_forwards, port, enabled);
+            if !apply_preset(&mut profile.port_forwards, port, enabled) {
+                return Ok::<_, String>((profile, None));
+            }
             let profile = i.profiles.upsert(profile)?;
 
-            let should_respawn = if let Some(session) = i.sessions.get_mut(&profile_id) {
+            let should_respawn = i
+                .sessions
+                .get(&profile_id)
+                .map(|session| matches!(session.phase, Phase::Connected | Phase::Reconnecting))
+                .unwrap_or(false);
+            if let Some(session) = i.sessions.get_mut(&profile_id) {
                 session.profile = profile.clone();
-                matches!(session.phase, Phase::Connected | Phase::Reconnecting)
+            }
+            let respawn_generation = if should_respawn {
+                i.next_generation += 1;
+                let generation = i.next_generation;
+                if let Some(session) = i.sessions.get_mut(&profile_id) {
+                    session.generation = generation;
+                }
+                i.reconnecting.insert(profile_id.clone(), generation);
+                Some(generation)
             } else {
-                false
+                None
             };
-            Ok::<_, String>((profile, should_respawn))
+            Ok::<_, String>((profile, respawn_generation))
         })?;
 
-        if should_respawn {
-            self.respawn_tunnel_keep_proxy(&profile)?;
+        if let Some(generation) = respawn_generation {
+            self.respawn_tunnel_keep_proxy(&profile, generation)?;
         }
         Ok(self.status())
     }
 
-    fn respawn_tunnel_keep_proxy(&self, profile: &GatewayProfile) -> Result<(), String> {
+    fn respawn_tunnel_keep_proxy(
+        &self,
+        profile: &GatewayProfile,
+        generation: u64,
+    ) -> Result<(), String> {
         let id = profile.id.clone();
-        let (local_http, local_socks, logs) = self.with_inner(|i| {
+        let (latest_profile, local_http, local_socks, logs) = self.with_inner(|i| {
             let session = i
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| "会话已丢失，无法重建隧道".to_string())?;
+            if session.generation != generation {
+                return Err("端口转发任务已过期".to_string());
+            }
             session.tunnel.kill();
-            i.reconnecting.insert(id.clone());
-            Ok::<_, String>((session.local_http, session.local_socks, i.logs.clone()))
+            let latest_profile = session.profile.clone();
+            let local_http = session.local_http;
+            let local_socks = session.local_socks;
+            i.reconnecting.insert(id.clone(), generation);
+            Ok::<_, String>((latest_profile, local_http, local_socks, i.logs.clone()))
         })?;
 
-        let tunnel = SshTunnel::spawn(profile, local_http, local_socks, logs);
+        let tunnel = SshTunnel::spawn(&latest_profile, local_http, local_socks, logs);
         self.with_inner(|i| {
-            i.reconnecting.remove(&id);
+            if i.reconnecting.get(&id) == Some(&generation) {
+                i.reconnecting.remove(&id);
+            }
             match tunnel {
                 Ok(tunnel) => {
-                    if let Some(session) = i.sessions.get_mut(&id) {
-                        session.tunnel = tunnel;
-                        session.last_error = None;
+                    let mut tunnel = Some(tunnel);
+                    let installed = if let Some(session) = i.sessions.get_mut(&id) {
+                        if session.generation != generation {
+                            false
+                        } else {
+                            session.tunnel =
+                                tunnel.take().expect("tunnel is available for installation");
+                            session.last_error = None;
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if installed {
+                        i.logs
+                            .push(format!("[{}] 已应用端口转发预设", latest_profile.name));
+                        Ok(())
+                    } else {
+                        if let Some(mut tunnel) = tunnel {
+                            tunnel.kill();
+                        }
+                        Err("端口转发任务已过期或会话已断开".to_string())
                     }
-                    i.logs
-                        .push(format!("[{}] 已应用端口转发预设", profile.name));
-                    Ok(())
                 }
                 Err(error) => {
-                    if let Some(session) = i.sessions.get_mut(&id) {
-                        session.last_error = Some(error.clone());
+                    let current = i
+                        .sessions
+                        .get(&id)
+                        .map(|session| session.generation == generation)
+                        .unwrap_or(false);
+                    if current {
+                        if let Some(session) = i.sessions.get_mut(&id) {
+                            session.last_error = Some(error.clone());
+                        }
+                        i.logs.push(format!(
+                            "[{}] 重建端口转发隧道失败: {error}",
+                            latest_profile.name
+                        ));
+                        Err(error)
+                    } else {
+                        Err("端口转发任务已过期或会话已断开".to_string())
                     }
-                    i.logs
-                        .push(format!("[{}] 重建端口转发隧道失败: {error}", profile.name));
-                    Err(error)
                 }
             }
         })
