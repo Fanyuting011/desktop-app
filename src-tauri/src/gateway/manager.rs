@@ -422,16 +422,27 @@ impl GatewayState {
     }
 
     pub fn disconnect(&self, profile_id: Option<String>) -> Result<GatewayStatus, String> {
-        let (profile, logs) = self.with_inner(|i| -> Result<(GatewayProfile, Arc<LogBuffer>), String> {
-            let id = profile_id
-                .or_else(|| i.profiles.active_id())
-                .ok_or_else(|| "未指定要断开的主机".to_string())?;
-            let session = i
-                .sessions
-                .get(&id)
-                .ok_or_else(|| "该主机未连接".to_string())?;
-            Ok((session.profile.clone(), i.logs.clone()))
-        })?;
+        let (profile, logs) =
+            self.with_inner(|i| -> Result<(GatewayProfile, Arc<LogBuffer>), String> {
+                let id = profile_id
+                    .or_else(|| i.profiles.active_id())
+                    .ok_or_else(|| "未指定要断开的主机".to_string())?;
+                let profile = i
+                    .sessions
+                    .get(&id)
+                    .ok_or_else(|| "该主机未连接".to_string())?
+                    .profile
+                    .clone();
+                // Invalidate every in-flight tunnel/terminal recovery before releasing
+                // the lock to tear down the session.
+                i.next_generation += 1;
+                let generation = i.next_generation;
+                if let Some(session) = i.sessions.get_mut(&id) {
+                    session.generation = generation;
+                }
+                i.reconnecting.insert(id, generation);
+                Ok((profile, i.logs.clone()))
+            })?;
 
         // Kill any interactive terminal for this host before tearing down the tunnel —
         // the terminal is a second, independent ssh process that would otherwise be
@@ -712,7 +723,6 @@ impl GatewayState {
                             session.phase = Phase::Connected;
                             session.last_error = None;
                             let reopen_terminal = session.terminal_reopen_required;
-                            session.terminal_reopen_required = false;
                             Some(reopen_terminal)
                         }
                     } else {
@@ -752,11 +762,42 @@ impl GatewayState {
         })?;
 
         if reopen_terminal {
+            let recovery_is_current = self.with_inner(|i| {
+                i.sessions
+                    .get(&id)
+                    .map(|session| {
+                        session.generation == generation && session.terminal_reopen_required
+                    })
+                    .unwrap_or(false)
+            });
+            if !recovery_is_current {
+                return Ok(());
+            }
+
             match terminals.open(app.clone(), &latest_profile) {
                 Ok(()) => {
-                    let _ = app.emit(&format!("terminal-reconnect-{id}"), ());
+                    let recovery_is_current = self.with_inner(|i| {
+                        let Some(session) = i.sessions.get_mut(&id) else {
+                            return false;
+                        };
+                        if session.generation != generation || !session.terminal_reopen_required {
+                            return false;
+                        }
+                        session.terminal_reopen_required = false;
+                        true
+                    });
+                    if recovery_is_current {
+                        let _ = app.emit(&format!("terminal-reconnect-{id}"), ());
+                    } else {
+                        terminals.close(&id);
+                    }
                 }
                 Err(error) => self.with_inner(|i| {
+                    if let Some(session) = i.sessions.get_mut(&id) {
+                        if session.generation == generation {
+                            session.terminal_reopen_required = true;
+                        }
+                    }
                     i.logs.push(format!(
                         "[{}] 应用端口转发预设后恢复终端失败: {error}",
                         latest_profile.name
