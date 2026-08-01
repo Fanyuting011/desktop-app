@@ -6,6 +6,7 @@ mod port_alloc;
 pub mod manager;
 mod profiles;
 mod proxy;
+mod ssh_bin;
 mod ssh_tunnel;
 mod terminal;
 

@@ -16,6 +16,7 @@ use tauri::{AppHandle, Emitter};
 
 use super::askpass::AskpassEnv;
 use super::profiles::GatewayProfile;
+use super::ssh_bin::resolve_ssh_bin;
 use super::ssh_tunnel::{prepare_askpass, ssh_common_args, target};
 
 /// Default terminal geometry until the frontend sends the real size via `resize`
@@ -64,7 +65,7 @@ impl TerminalHub {
             })
             .map_err(|e| format!("创建 PTY 失败: {e}"))?;
 
-        let mut cmd = CommandBuilder::new("ssh");
+        let mut cmd = CommandBuilder::new(resolve_ssh_bin()?);
         for arg in ssh_common_args(profile) {
             cmd.arg(arg);
         }

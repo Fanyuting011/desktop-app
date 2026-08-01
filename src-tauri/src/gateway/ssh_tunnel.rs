@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use super::askpass::AskpassEnv;
 use super::log_buffer::LogBuffer;
 use super::profiles::GatewayProfile;
+use super::ssh_bin::resolve_ssh_bin;
 
 pub struct SshTunnel {
     child: Child,
@@ -63,8 +64,11 @@ pub(crate) fn ssh_common_args(profile: &GatewayProfile) -> Vec<String> {
     args
 }
 
-fn base_ssh_cmd(profile: &GatewayProfile, askpass: Option<&AskpassEnv>) -> Command {
-    let mut cmd = Command::new("ssh");
+fn base_ssh_cmd(
+    profile: &GatewayProfile,
+    askpass: Option<&AskpassEnv>,
+) -> Result<Command, String> {
+    let mut cmd = Command::new(resolve_ssh_bin()?);
     for arg in ssh_common_args(profile) {
         cmd.arg(arg);
     }
@@ -73,7 +77,7 @@ fn base_ssh_cmd(profile: &GatewayProfile, askpass: Option<&AskpassEnv>) -> Comma
             ap.apply(&mut cmd);
         }
     }
-    cmd
+    Ok(cmd)
 }
 
 pub(crate) fn prepare_askpass(profile: &GatewayProfile) -> Result<Option<AskpassEnv>, String> {
@@ -99,7 +103,7 @@ pub fn verify_ssh_auth(profile: &GatewayProfile, logs: Arc<LogBuffer>) -> Result
     ));
 
     let askpass = prepare_askpass(profile)?;
-    let mut cmd = base_ssh_cmd(profile, askpass.as_ref());
+    let mut cmd = base_ssh_cmd(profile, askpass.as_ref())?;
     cmd.arg(&dest).arg("true");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -149,7 +153,7 @@ impl SshTunnel {
         let dest = target(profile);
         let askpass = prepare_askpass(profile)?;
 
-        let mut cmd = base_ssh_cmd(profile, askpass.as_ref());
+        let mut cmd = base_ssh_cmd(profile, askpass.as_ref())?;
         cmd.arg("-N")
             .arg("-o")
             .arg("ExitOnForwardFailure=yes")
@@ -233,7 +237,7 @@ impl SshTunnel {
             }
         }
 
-        let mut check = base_ssh_cmd(profile, askpass.as_ref());
+        let mut check = base_ssh_cmd(profile, askpass.as_ref())?;
         check
             .arg(&dest)
             .arg(format!(
@@ -250,7 +254,7 @@ impl SshTunnel {
                 ));
             }
             Ok(_) => {
-                let mut check2 = base_ssh_cmd(profile, askpass.as_ref());
+                let mut check2 = base_ssh_cmd(profile, askpass.as_ref())?;
                 check2.arg(&dest).arg(format!(
                     "bash -lc '(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -E \":{remote_http}\\\\b\"'"
                 ));
@@ -310,7 +314,7 @@ pub fn remote_run_script(
     logs: Arc<LogBuffer>,
 ) -> Result<String, String> {
     let askpass = prepare_askpass(profile)?;
-    let mut cmd = base_ssh_cmd(profile, askpass.as_ref());
+    let mut cmd = base_ssh_cmd(profile, askpass.as_ref())?;
     let dest = target(profile);
 
     // Encode script as base64 so we don't rely on SSH stdin forwarding
@@ -366,7 +370,7 @@ pub fn remote_run_shell(
     logs: Arc<LogBuffer>,
 ) -> Result<String, String> {
     let askpass = prepare_askpass(profile)?;
-    let mut cmd = base_ssh_cmd(profile, askpass.as_ref());
+    let mut cmd = base_ssh_cmd(profile, askpass.as_ref())?;
     let dest = target(profile);
     // Use bash -lc so PATH hooks from profile may apply; still prepend bin explicitly in callers when needed.
     let remote = format!("bash -lc {}", shell_escape(shell_cmd));
