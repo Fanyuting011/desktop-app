@@ -338,17 +338,63 @@ async fn handle_http_client(
 
     // Absolute-form HTTP proxy request
     let url = target.to_string();
-    let (hostport, path) = parse_absolute_url(&url).ok_or("invalid proxy url")?;
+    let (hostport, path) = match parse_absolute_url(&url) {
+        Some(parsed) => parsed,
+        None => {
+            push_network_log(
+                net_log,
+                profile_id,
+                "http",
+                &url,
+                Some("无法解析代理请求 URL".to_string()),
+            );
+            return Err("invalid proxy url".into());
+        }
+    };
 
     // If upstream is HTTP proxy, forward the original absolute-form request to it.
     if let Some(UpstreamKind::Http { hostport: up }) = upstream {
-        let mut remote = TcpStream::connect(up).await?;
-        remote.write_all(&buf[..n]).await?;
-        relay(client, remote).await?;
+        match TcpStream::connect(up).await {
+            Ok(mut remote) => {
+                push_network_log(net_log, profile_id, "http", &hostport, None);
+                remote.write_all(&buf[..n]).await?;
+                relay(client, remote).await?;
+            }
+            Err(error) => {
+                push_network_log(
+                    net_log,
+                    profile_id,
+                    "http",
+                    &hostport,
+                    Some(error.to_string()),
+                );
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                    .await?;
+            }
+        }
         return Ok(());
     }
 
-    let mut remote = dial_target(&hostport, upstream).await?;
+    let mut remote = match dial_target(&hostport, upstream).await {
+        Ok(remote) => {
+            push_network_log(net_log, profile_id, "http", &hostport, None);
+            remote
+        }
+        Err(error) => {
+            push_network_log(
+                net_log,
+                profile_id,
+                "http",
+                &hostport,
+                Some(error.to_string()),
+            );
+            client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+    };
     let mut rewritten = format!("{method} {path} HTTP/1.1\r\n");
     let mut saw_host = false;
     for line in header_text.lines().skip(1) {
@@ -611,6 +657,73 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
         client
             .write_all(format!("CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.protocol, "http");
+        assert_eq!(entry.target, format!("127.0.0.1:{target_port}"));
+        assert!(!entry.ok);
+        assert!(entry.error.is_some());
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn http_absolute_form_emits_success_log() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = target.accept().await;
+        });
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-http-absolute".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+        client
+            .write_all(
+                format!("GET http://{target_addr}/hello HTTP/1.1\r\nHost: {target_addr}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.profile_id, "profile-http-absolute");
+        assert_eq!(entry.protocol, "http");
+        assert_eq!(entry.target, target_addr.to_string());
+        assert!(entry.ok);
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn http_absolute_form_emits_failure_log() {
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-http-absolute-fail".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+        let target_port = unused_port().await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{target_port}/ HTTP/1.1\r\n\r\n").as_bytes(),
+            )
             .await
             .unwrap();
 
