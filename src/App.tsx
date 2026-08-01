@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import LogsPanel from "./components/LogsPanel";
 import NetworkPanel from "./components/NetworkPanel";
 import HostTerminal from "./components/HostTerminal";
+import ConnectingOverlay from "./components/ConnectingOverlay";
 import "./App.css";
 
 type Phase = "idle" | "connected" | "proxyOn" | "reconnecting";
@@ -25,6 +27,15 @@ interface GatewayProfile {
   remoteSocksPort: number;
   autoReconnect: boolean;
   noProxy: string[];
+  portForwards?: Array<{
+    id: string;
+    enabled: boolean;
+    localHost: string;
+    localPort: number;
+    remoteHost: string;
+    remotePort: number;
+    label?: string | null;
+  }>;
   updatedAt: string;
 }
 
@@ -45,6 +56,17 @@ interface GatewayStatus {
 }
 
 const UPSTREAM_KEY = "outgate.upstreamProxy";
+const PRESET_PORTS = [3000, 8080, 5432] as const;
+
+function presetEnabled(draft: GatewayProfile, port: number) {
+  return (draft.portForwards ?? []).some(
+    (forward) =>
+      forward.enabled &&
+      forward.localPort === port &&
+      forward.remotePort === port &&
+      (forward.remoteHost === "127.0.0.1" || forward.remoteHost === "localhost"),
+  );
+}
 
 function noProxyToText(list: string[]) {
   return list.join("\n");
@@ -60,11 +82,6 @@ function textToNoProxy(text: string) {
 function phaseOf(status: GatewayStatus | null, id: string | undefined): Phase {
   if (!status || !id) return "idle";
   return status.sessions.find((s) => s.profileId === id)?.phase ?? "idle";
-}
-
-function errorOf(status: GatewayStatus | null, id: string | undefined): string | null {
-  if (!status || !id) return null;
-  return status.sessions.find((s) => s.profileId === id)?.lastError ?? null;
 }
 
 function isLive(phase: Phase): boolean {
@@ -87,9 +104,16 @@ export default function App() {
   const [draft, setDraft] = useState<GatewayProfile | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [presetBusyPort, setPresetBusyPort] = useState<number | null>(null);
   const [message, setMessage] = useState("");
   const [query, setQuery] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [connectingProfile, setConnectingProfile] = useState<GatewayProfile | null>(null);
+  const [connectPhase, setConnectPhase] = useState<"connecting" | "failed">("connecting");
+  const [connectError, setConnectError] = useState("");
+  const [showConnectLogs, setShowConnectLogs] = useState(false);
+  const [connectLogs, setConnectLogs] = useState<string[]>([]);
+  const connectCancelled = useRef(false);
   const [upstream, setUpstream] = useState(() => {
     try {
       return localStorage.getItem(UPSTREAM_KEY) ?? "";
@@ -101,12 +125,15 @@ export default function App() {
   const draftPhase = phaseOf(status, draft?.id);
   const draftConnected = isLive(draftPhase);
   const draftEditable = !draftConnected;
+  const enabledPresetPorts = draft
+    ? PRESET_PORTS.filter((port) => presetEnabled(draft, port))
+    : [];
+  const draftIsSaved = !!draft && profiles.some((profile) => profile.id === draft.id);
   const anyConnected = (status?.sessions?.length ?? 0) > 0;
   const noProxySummary =
     draft?.noProxy.join(", ") ??
     profiles.find((profile) => profile.id === status?.activeProfileId)?.noProxy.join(", ") ??
     "";
-  const draftError = errorOf(status, draft?.id);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -219,9 +246,35 @@ export default function App() {
     }
   }
 
+  async function togglePreset(port: number) {
+    if (!draft || !draftIsSaved) return;
+    setPresetBusyPort(port);
+    setMessage("");
+    try {
+      const st = await invoke<GatewayStatus>("gateway_set_port_forward_preset", {
+        profileId: draft.id,
+        port,
+        enabled: !presetEnabled(draft, port),
+      });
+      setStatus(st);
+      await refresh();
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setPresetBusyPort(null);
+    }
+  }
+
   async function connect() {
-    if (!draft) return;
-    const id = draft.id;
+    if (!draft || draftConnected) return;
+    const profile = { ...draft };
+    const id = profile.id;
+    connectCancelled.current = false;
+    setConnectingProfile(profile);
+    setConnectPhase("connecting");
+    setConnectError("");
+    setShowConnectLogs(false);
+    setConnectLogs([]);
     setBusy(true);
     setBusyId(id);
     setMessage("");
@@ -231,21 +284,49 @@ export default function App() {
         profileId: id,
         upstreamProxy: upstream.trim() || null,
       });
-      setStatus(st);
-      setCenterTab(id);
+      if (connectCancelled.current) {
+        try {
+          await invoke("gateway_disconnect", { profileId: id });
+        } catch {
+          /* ignore */
+        }
+        await refresh();
+        return;
+      }
+      // Open PTY before React mounts HostTerminal (setStatus/setCenterTab),
+      // otherwise early resize calls fail and bash stays at 80 cols — Up-arrow
+      // history redraw then walks into previous lines and overwrites them.
       try {
         await invoke("gateway_terminal_open", { profileId: id });
       } catch (e) {
         setMessage(String(e));
       }
+      setStatus(st);
+      setConnectingProfile(null);
+      setCenterTab(id);
       await refresh();
     } catch (e) {
-      setMessage(String(e));
+      if (connectCancelled.current) {
+        setConnectingProfile(null);
+        await refresh();
+        return;
+      }
+      setConnectPhase("failed");
+      setConnectError(String(e));
       await refresh();
     } finally {
       setBusy(false);
       setBusyId(null);
     }
+  }
+
+  function closeConnectingOverlay() {
+    if (connectPhase === "connecting" && busyId) {
+      connectCancelled.current = true;
+    }
+    setConnectingProfile(null);
+    setConnectError("");
+    setShowConnectLogs(false);
   }
 
   async function disconnectProfile(id: string) {
@@ -268,10 +349,26 @@ export default function App() {
     }
   }
 
-  async function disconnect() {
-    if (!draft) return;
-    await disconnectProfile(draft.id);
-  }
+  useEffect(() => {
+    if (!connectingProfile || connectPhase !== "connecting") return;
+    let alive = true;
+    const tick = () => {
+      invoke<string[]>("gateway_get_logs", {
+        limit: 80,
+        profileId: connectingProfile.id,
+      })
+        .then((lines) => {
+          if (alive) setConnectLogs(lines);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const id = window.setInterval(tick, 800);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [connectingProfile, connectPhase]);
 
   async function checkUpdate() {
     setBusy(true);
@@ -301,9 +398,10 @@ export default function App() {
   }
 
   const terminalFocused = nav === "hosts" && centerTab !== "hosts";
+  const connectingView = nav === "hosts" && centerTab === "hosts" && !!connectingProfile;
 
   return (
-    <div className={terminalFocused ? "shell wide-center" : "shell"}>
+    <div className={terminalFocused || connectingView ? "shell wide-center" : "shell"}>
       <aside className="nav">
         <div className="brand">OutGate</div>
         <button
@@ -377,7 +475,19 @@ export default function App() {
             ))}
           </div>
 
-          {centerTab === "hosts" && (
+          {centerTab === "hosts" && connectingProfile && (
+            <ConnectingOverlay
+              profile={connectingProfile}
+              phase={connectPhase}
+              error={connectError}
+              logs={connectLogs}
+              showLogs={showConnectLogs}
+              onToggleLogs={() => setShowConnectLogs((v) => !v)}
+              onClose={closeConnectingOverlay}
+            />
+          )}
+
+          {centerTab === "hosts" && !connectingProfile && (
             <>
               <div className="toolbar">
                 <input
@@ -395,7 +505,7 @@ export default function App() {
                   disabled={busy || !draft || draftConnected}
                   onClick={connect}
                 >
-                  {busyId === draft?.id && !draftConnected ? "Connecting…" : "Connect"}
+                  Connect
                 </button>
               </div>
 
@@ -446,7 +556,7 @@ export default function App() {
           )}
         </section>
 
-        {nav === "hosts" && centerTab === "hosts" && (
+        {nav === "hosts" && centerTab === "hosts" && !connectingProfile && (
           <aside className="details">
             <header className="details-head">
               <h2>Host Details</h2>
@@ -566,6 +676,53 @@ export default function App() {
                     />
                   </label>
                 </div>
+                <section className="preview-ports" aria-labelledby="preview-ports-title">
+                  <div className="preview-ports-head">
+                    <span id="preview-ports-title">本地预览</span>
+                    {!draftIsSaved && <span>请先保存主机</span>}
+                  </div>
+                  <div className="preview-port-chips" aria-label="预览端口">
+                    {PRESET_PORTS.map((port) => {
+                      const enabled = presetEnabled(draft, port);
+                      return (
+                        <button
+                          key={port}
+                          type="button"
+                          className={enabled ? "preview-port-chip selected" : "preview-port-chip"}
+                          disabled={!draftIsSaved || presetBusyPort !== null}
+                          aria-pressed={enabled}
+                          onClick={() => togglePreset(port)}
+                        >
+                          {port}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {enabledPresetPorts.length === 0 ? (
+                    <p className="preview-port-empty">未启用预览端口</p>
+                  ) : (
+                    <div className="preview-port-list">
+                      {enabledPresetPorts.map((port) => (
+                        <div key={port} className="preview-port-item">
+                          <span>127.0.0.1:{port}</span>
+                          {draftConnected && (port === 3000 || port === 8080) && (
+                            <button
+                              type="button"
+                              className="link"
+                              onClick={() =>
+                                openUrl(`http://127.0.0.1:${port}`).catch((e) =>
+                                  setMessage(String(e)),
+                                )
+                              }
+                            >
+                              打开
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
                 <label>
                   NO_PROXY
                   <textarea
@@ -607,24 +764,18 @@ export default function App() {
                   >
                     Save
                   </button>
-                  {draftConnected ? (
-                    <button type="button" className="btn danger" disabled={busy} onClick={disconnect}>
-                      {busyId === draft.id ? "Disconnecting…" : "Disconnect"}
-                    </button>
-                  ) : (
+                  {!draftConnected && (
                     <button
                       type="button"
                       className="btn primary wide"
                       disabled={busy || !draft}
                       onClick={connect}
                     >
-                      {busyId === draft.id ? "Connecting…" : "Connect"}
+                      Connect
                     </button>
                   )}
                 </div>
-                {(message || draftError) && (
-                  <p className="banner">{message || draftError}</p>
-                )}
+                {message && <p className="banner">{message}</p>}
               </div>
             )}
           </aside>
