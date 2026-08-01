@@ -64,6 +64,47 @@ pub(crate) fn ssh_common_args(profile: &GatewayProfile) -> Vec<String> {
     args
 }
 
+fn enabled_local_ports(profile: &GatewayProfile) -> Vec<u16> {
+    profile
+        .port_forwards
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| f.local_port)
+        .collect()
+}
+
+/// When ssh stderr indicates a local bind failure, return a clearer message if one
+/// enabled local port can be identified (single rule, or exactly one port in stderr).
+fn format_bind_failure(detail: &str, profile: &GatewayProfile) -> String {
+    let is_bind_error = detail.contains("bind")
+        || detail.contains("Address already in use")
+        || detail.contains("forwarding failed");
+    if !is_bind_error {
+        return detail.to_string();
+    }
+
+    let enabled_ports = enabled_local_ports(profile);
+    let port = if enabled_ports.len() == 1 {
+        Some(enabled_ports[0])
+    } else {
+        let matched: Vec<u16> = enabled_ports
+            .iter()
+            .copied()
+            .filter(|p| detail.contains(&p.to_string()))
+            .collect();
+        if matched.len() == 1 {
+            Some(matched[0])
+        } else {
+            None
+        }
+    };
+
+    match port {
+        Some(n) => format!("本地端口 {n} 已被占用，请关掉占用进程或换端口"),
+        None => detail.to_string(),
+    }
+}
+
 fn base_ssh_cmd(
     profile: &GatewayProfile,
     askpass: Option<&AskpassEnv>,
@@ -164,8 +205,21 @@ impl SshTunnel {
             .arg("-R")
             .arg(format!("127.0.0.1:{remote_http}:127.0.0.1:{local_http}"))
             .arg("-R")
-            .arg(format!("127.0.0.1:{remote_socks}:127.0.0.1:{local_socks}"))
-            .arg(&dest);
+            .arg(format!("127.0.0.1:{remote_socks}:127.0.0.1:{local_socks}"));
+        for fw in profile.port_forwards.iter().filter(|f| f.enabled) {
+            cmd.arg("-L").arg(format!(
+                "{}:{}:{}:{}",
+                fw.local_host.trim(),
+                fw.local_port,
+                fw.remote_host.trim(),
+                fw.remote_port
+            ));
+            logs.push(format!(
+                "本地转发 -L {}:{} → {}:{}",
+                fw.local_host, fw.local_port, fw.remote_host, fw.remote_port
+            ));
+        }
+        cmd.arg(&dest);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -218,15 +272,17 @@ impl SshTunnel {
                         .lock()
                         .map(|g| g.join(" | "))
                         .unwrap_or_default();
-                    return Err(format!(
-                        "SSH 隧道退出 (code {:?}){}",
-                        status.code(),
-                        if detail.is_empty() {
-                            String::new()
+                    let message = if detail.is_empty() {
+                        format!("SSH 隧道退出 (code {:?})", status.code())
+                    } else {
+                        let friendly = format_bind_failure(&detail, profile);
+                        if friendly == detail {
+                            format!("SSH 隧道退出 (code {:?}): {detail}", status.code())
                         } else {
-                            format!(": {detail}")
+                            format!("SSH 隧道退出 (code {:?}): {friendly}", status.code())
                         }
-                    ));
+                    };
+                    return Err(message);
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
