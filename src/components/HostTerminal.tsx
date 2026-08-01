@@ -22,11 +22,13 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     if (!container) return;
 
     const term = new Terminal({
-      convertEol: true,
-      fontFamily: '"SF Mono", "Menlo", ui-monospace, monospace',
-      fontSize: 12,
-      lineHeight: 1.35,
+      // convertEol breaks readline Up-arrow redraw (cursor column desync).
+      convertEol: false,
+      fontFamily: '"SF Mono", "Menlo", "Cascadia Mono", ui-monospace, monospace',
+      fontSize: 13,
+      lineHeight: 1.3,
       cursorBlink: true,
+      cursorStyle: "block",
       scrollback: 5000,
       theme: {
         background: "#0f1720",
@@ -37,21 +39,61 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
-    try {
-      fit.fit();
-    } catch {
-      /* container not laid out yet */
-    }
+
+    let cancelled = false;
+    let lastSent = { cols: 0, rows: 0 };
+    let resizeSynced = false;
+
+    const sendResize = async (force = false) => {
+      if (cancelled) return false;
+      try {
+        fit.fit();
+      } catch {
+        return false;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      if (cols < 2 || rows < 1) return false;
+      if (!force && cols === lastSent.cols && rows === lastSent.rows && resizeSynced) {
+        return true;
+      }
+      try {
+        await invoke("gateway_terminal_resize", { profileId, cols, rows });
+        lastSent = { cols, rows };
+        resizeSynced = true;
+        return true;
+      } catch {
+        // PTY often not open yet (HostTerminal mounts before gateway_terminal_open finishes).
+        resizeSynced = false;
+        return false;
+      }
+    };
+
+    // Keep trying until the backend PTY exists and accepts the real size.
+    // Without this, bash stays at 80x24 while xterm is wider → Up-arrow
+    // redraw walks into previous output and overwrites it.
+    const resizeRetry = window.setInterval(() => {
+      void sendResize();
+    }, 250);
+    window.setTimeout(() => window.clearInterval(resizeRetry), 20_000);
+
+    requestAnimationFrame(() => {
+      void sendResize(true);
+    });
 
     const injectedRef = { current: false };
     const injectOnce = () => {
       if (injectedRef.current) return;
       injectedRef.current = true;
-      invoke("gateway_terminal_write", { profileId, data: INJECT_CMD }).catch((error) => {
-        console.warn(`Failed to inject OutGate environment for profile ${profileId}`, error);
-      });
+      void (async () => {
+        await sendResize(true);
+        try {
+          await invoke("gateway_terminal_write", { profileId, data: INJECT_CMD });
+        } catch (error) {
+          console.warn(`Failed to inject OutGate environment for profile ${profileId}`, error);
+        }
+      })();
     };
-    let cancelled = false;
     let injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
     const unlisteners: Array<() => void> = [];
     const track = (fn: () => void) => {
@@ -61,6 +103,7 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
 
     listen<string>(`terminal-output-${profileId}`, (event) => {
       term.write(event.payload);
+      void sendResize();
       injectOnce();
     }).then(track);
 
@@ -68,38 +111,26 @@ export default function HostTerminal({ profileId }: HostTerminalProps) {
       invoke("gateway_terminal_write", { profileId, data }).catch(() => {});
     });
 
-    const sendResize = () => {
-      try {
-        fit.fit();
-      } catch {
-        return;
-      }
-      invoke("gateway_terminal_resize", {
-        profileId,
-        cols: term.cols,
-        rows: term.rows,
-      }).catch(() => {});
-    };
-    const resizeObserver = new ResizeObserver(sendResize);
+    const resizeObserver = new ResizeObserver(() => {
+      void sendResize(true);
+    });
     resizeObserver.observe(container);
-    sendResize();
 
-    // Auto-reconnect kills the terminal's ssh process along with the dead tunnel and
-    // spawns a fresh one behind the same tab. Clear the stale buffer, re-send the real
-    // geometry (the new PTY starts at the default 80x24) and re-arm the injection so the
-    // new login shell gets `outgate on` too.
     listen(`terminal-reconnect-${profileId}`, () => {
       term.reset();
       term.writeln("\x1b[2m— 隧道已重连，终端会话已重建 —\x1b[0m");
       injectedRef.current = false;
+      resizeSynced = false;
+      lastSent = { cols: 0, rows: 0 };
       window.clearTimeout(injectTimer);
       injectTimer = window.setTimeout(injectOnce, INJECT_TIMEOUT_MS);
-      sendResize();
+      void sendResize(true);
     }).then(track);
 
     return () => {
       cancelled = true;
       window.clearTimeout(injectTimer);
+      window.clearInterval(resizeRetry);
       resizeObserver.disconnect();
       dataDisposable.dispose();
       unlisteners.forEach((fn) => fn());

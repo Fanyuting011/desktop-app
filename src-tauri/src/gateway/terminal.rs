@@ -69,6 +69,11 @@ impl TerminalHub {
         for arg in ssh_common_args(profile) {
             cmd.arg(arg);
         }
+        // Force a PTY on the remote side and advertise a modern TERM so bash/readline
+        // (Up-arrow history redraw, colors, etc.) behave correctly.
+        cmd.arg("-t");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         if let Some(ap) = askpass.as_ref() {
             for (k, v) in ap.env_pairs() {
                 cmd.env(k, v);
@@ -150,6 +155,9 @@ impl TerminalHub {
     }
 
     pub fn resize(&self, profile_id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        if cols < 2 || rows < 1 {
+            return Ok(());
+        }
         let sessions = self.sessions.lock().expect("terminal hub poisoned");
         let session = sessions
             .get(profile_id)
