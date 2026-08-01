@@ -106,9 +106,10 @@ struct Inner {
     /// tunnel keeps reporting dead from `try_wait()` until it is replaced, so without this
     /// guard every 3s poll would enqueue yet another reconnect on top of the in-flight one.
     reconnecting: HashMap<String, u64>,
-    /// Profile ids with an SCP process in flight. A profile may only run one transfer at a
-    /// time, while transfers to separate connected profiles remain independent.
-    transfer_busy: HashSet<String>,
+    /// Profile ids with an SCP process in flight, mapped to a human-readable description of
+    /// what is being transferred (e.g. "上传 → ~/uploads"). A profile may only run one
+    /// transfer at a time, while transfers to separate connected profiles remain independent.
+    transfer_busy: HashMap<String, String>,
     /// Never reset across disconnect/reconnect, so a stale task cannot match a new session
     /// that reuses the same profile id.
     next_generation: u64,
@@ -170,7 +171,7 @@ impl GatewayState {
                 sessions: HashMap::new(),
                 pending: HashSet::new(),
                 reconnecting: HashMap::new(),
-                transfer_busy: HashSet::new(),
+                transfer_busy: HashMap::new(),
                 next_generation: 0,
                 upstream: None,
                 runtime,
@@ -706,15 +707,22 @@ impl GatewayState {
         })?;
 
         if let Some(generation) = respawn_generation {
-            self.respawn_tunnel_keep_proxy(&profile, generation)?;
+            self.respawn_tunnel_keep_proxy(&profile, generation, Some((port, enabled)))?;
         }
         Ok(self.status())
     }
 
+    /// `rollback_preset`, when set, is the `(port, enabled)` toggle that was just applied to
+    /// reach `profile`. If the respawned tunnel fails to come up, that toggle is reverted
+    /// (persisted store + in-memory session profile) before returning the error, so the
+    /// profile never keeps a rule that is known to prevent the tunnel from starting — without
+    /// this, the dead tunnel would keep tripping `poll_and_maybe_reconnect`'s auto-reconnect
+    /// with the same broken rule every 3s, forever (see review I2).
     fn respawn_tunnel_keep_proxy(
         &self,
         profile: &GatewayProfile,
         generation: u64,
+        rollback_preset: Option<(u16, bool)>,
     ) -> Result<(), String> {
         let id = profile.id.clone();
         let (latest_profile, local_http, local_socks, logs) = self.with_inner(|i| {
@@ -773,6 +781,32 @@ impl GatewayState {
                         .map(|session| session.generation == generation)
                         .unwrap_or(false);
                     if current {
+                        if let Some((port, enabled)) = rollback_preset {
+                            // Revert the toggle that led to this failed respawn so the
+                            // persisted profile (and the live session's copy of it) never
+                            // keeps a rule that is known to prevent the tunnel from starting.
+                            if let Some(mut stored) = i.profiles.get(&id) {
+                                if apply_preset(&mut stored.port_forwards, port, !enabled) {
+                                    match i.profiles.upsert(stored) {
+                                        Ok(saved) => {
+                                            if let Some(session) = i.sessions.get_mut(&id) {
+                                                session.profile = saved;
+                                            }
+                                            i.logs.push(format!(
+                                                "[{}] 端口 {port} 转发导致隧道失败，已回滚该预设",
+                                                latest_profile.name
+                                            ));
+                                        }
+                                        Err(save_err) => {
+                                            i.logs.push(format!(
+                                                "[{}] 回滚端口 {port} 预设失败: {save_err}",
+                                                latest_profile.name
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(session) = i.sessions.get_mut(&id) {
                             session.last_error = Some(error.clone());
                         }
@@ -869,7 +903,8 @@ impl GatewayState {
         local_path: String,
         remote_path: String,
     ) -> Result<(), String> {
-        let profile = self.reserve_transfer(&profile_id)?;
+        let profile =
+            self.reserve_transfer(&profile_id, format!("上传中 → {remote_path}"))?;
         let _guard = TransferGuard {
             state: self.clone(),
             id: profile_id,
@@ -883,7 +918,8 @@ impl GatewayState {
         remote_path: String,
         local_path: String,
     ) -> Result<(), String> {
-        let profile = self.reserve_transfer(&profile_id)?;
+        let profile =
+            self.reserve_transfer(&profile_id, format!("下载中 ← {remote_path}"))?;
         let _guard = TransferGuard {
             state: self.clone(),
             id: profile_id,
@@ -891,22 +927,38 @@ impl GatewayState {
         run_download(&profile, &remote_path, &local_path)
     }
 
-    pub fn transfer_status(&self) -> TransferStatus {
+    /// Reports transfer busy state for a single host (`profile_id`, defaulting to the
+    /// active profile), not a global HashSet-derived state — a transfer on host A must never
+    /// report as busy, or lock UI, for host B (see review I3).
+    pub fn transfer_status(&self, profile_id: Option<String>) -> TransferStatus {
         self.with_inner(|i| {
-            let profile_id = i.transfer_busy.iter().min().cloned();
-            TransferStatus {
-                state: if profile_id.is_some() {
-                    "running".to_string()
-                } else {
-                    "idle".to_string()
+            let query_id = profile_id.or_else(|| i.profiles.active_id());
+            let busy = query_id
+                .as_ref()
+                .and_then(|id| i.transfer_busy.get(id).map(|desc| (id.clone(), desc.clone())));
+            match busy {
+                Some((id, desc)) => {
+                    let name = i
+                        .profiles
+                        .get(&id)
+                        .map(|p| p.name)
+                        .unwrap_or_else(|| id.clone());
+                    TransferStatus {
+                        profile_id: Some(id),
+                        state: "running".to_string(),
+                        detail: Some(format!("{name} {desc}")),
+                    }
+                }
+                None => TransferStatus {
+                    profile_id: None,
+                    state: "idle".to_string(),
+                    detail: None,
                 },
-                detail: profile_id.as_ref().map(|id| format!("主机 {id} 正在传输")),
-                profile_id,
             }
         })
     }
 
-    fn reserve_transfer(&self, profile_id: &str) -> Result<GatewayProfile, String> {
+    fn reserve_transfer(&self, profile_id: &str, description: String) -> Result<GatewayProfile, String> {
         self.with_inner(|i| {
             let profile = i
                 .sessions
@@ -914,9 +966,10 @@ impl GatewayState {
                 .ok_or_else(|| "请先 Connect 该主机".to_string())?
                 .profile
                 .clone();
-            if !i.transfer_busy.insert(profile_id.to_string()) {
+            if i.transfer_busy.contains_key(profile_id) {
                 return Err("请等待当前传输完成".to_string());
             }
+            i.transfer_busy.insert(profile_id.to_string(), description);
             Ok(profile)
         })
     }

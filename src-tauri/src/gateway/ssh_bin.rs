@@ -7,7 +7,6 @@ pub fn resolve_ssh_bin() -> Result<PathBuf, String> {
     resolve_bin("ssh", ssh_candidates())
 }
 
-#[allow(dead_code)]
 pub fn resolve_scp_bin() -> Result<PathBuf, String> {
     resolve_bin("scp", scp_candidates())
 }
@@ -24,8 +23,17 @@ fn resolve_bin(name: &str, candidates: Vec<PathBuf>) -> Result<PathBuf, String> 
 }
 
 #[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    let output = Command::new("where").arg(name).output().ok()?;
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("where")
+        .arg(name)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -55,7 +63,6 @@ pub(crate) fn ssh_candidates() -> Vec<PathBuf> {
     candidates("ssh")
 }
 
-#[allow(dead_code)]
 pub(crate) fn scp_candidates() -> Vec<PathBuf> {
     candidates("scp")
 }

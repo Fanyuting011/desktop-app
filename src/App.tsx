@@ -131,6 +131,7 @@ export default function App() {
     : [];
   const draftIsSaved = !!draft && profiles.some((profile) => profile.id === draft.id);
   const anyConnected = (status?.sessions?.length ?? 0) > 0;
+  const draftError = status?.sessions.find((s) => s.profileId === draft?.id)?.lastError ?? null;
   const noProxySummary =
     draft?.noProxy.join(", ") ??
     profiles.find((profile) => profile.id === status?.activeProfileId)?.noProxy.join(", ") ??
@@ -777,7 +778,7 @@ export default function App() {
                   >
                     Save
                   </button>
-                  {!draftConnected && (
+                  {!draftConnected ? (
                     <button
                       type="button"
                       className="btn primary wide"
@@ -786,8 +787,18 @@ export default function App() {
                     >
                       Connect
                     </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn danger wide"
+                      disabled={busy}
+                      onClick={() => disconnectProfile(draft.id)}
+                    >
+                      Disconnect
+                    </button>
                   )}
                 </div>
+                {draftError && <p className="banner">会话错误：{draftError}</p>}
                 {message && <p className="banner">{message}</p>}
               </div>
             )}

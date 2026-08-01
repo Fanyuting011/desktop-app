@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 interface GatewayProfileLite {
   id: string;
@@ -29,10 +30,6 @@ interface FilesPanelProps {
   status: GatewayStatus | null;
 }
 
-interface TauriFile extends File {
-  path?: string;
-}
-
 const POLL_MS = 1000;
 
 function profileName(profile: GatewayProfileLite) {
@@ -46,6 +43,7 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
   );
   const [profileId, setProfileId] = useState("");
   const [remotePath, setRemotePath] = useState("~");
+  const [downloadPath, setDownloadPath] = useState("");
   const [transfer, setTransfer] = useState<TransferStatus>({
     profileId: null,
     state: "idle",
@@ -53,6 +51,7 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
   });
   const [message, setMessage] = useState("");
   const [dragging, setDragging] = useState(false);
+  const dropZoneRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const preferred = profiles.find((profile) => liveIds.has(profile.id)) ?? profiles[0];
@@ -60,12 +59,16 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
   }, [liveIds, profiles]);
 
   const loadTransferStatus = useCallback(async () => {
+    if (!profileId) {
+      setTransfer({ profileId: null, state: "idle", detail: null });
+      return;
+    }
     try {
-      setTransfer(await invoke<TransferStatus>("gateway_transfer_status"));
+      setTransfer(await invoke<TransferStatus>("gateway_transfer_status", { profileId }));
     } catch (error) {
       setMessage(String(error));
     }
-  }, []);
+  }, [profileId]);
 
   useEffect(() => {
     if (!active) return;
@@ -75,6 +78,8 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
   }, [active, loadTransferStatus]);
 
   const connected = liveIds.has(profileId);
+  // Scoped to the currently selected host — a transfer on another host must never disable
+  // this host's controls or lock the host picker (see review I3).
   const running = transfer.state === "running" && transfer.profileId === profileId;
   const disabled = !connected || running;
 
@@ -100,6 +105,55 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
     [disabled, loadTransferStatus, profileId, remotePath],
   );
 
+  // Tauri 2 removes the Tauri-1-only `File.path` extension, so HTML5 `drop` events can never
+  // carry a usable filesystem path. Drag-and-drop must instead be driven by the webview-level
+  // `onDragDropEvent` API, gated to when the Files panel is active and the pointer is over
+  // this panel's drop zone (so switching to Hosts/Logs — or dropping outside the zone — never
+  // triggers an upload). See review C2.
+  useEffect(() => {
+    if (!active) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    const isOverDropZone = (physical: { toLogical: (scale: number) => { x: number; y: number } }) => {
+      const zone = dropZoneRef.current;
+      if (!zone) return false;
+      const scale = window.devicePixelRatio || 1;
+      const { x, y } = physical.toLogical(scale);
+      const rect = zone.getBoundingClientRect();
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    };
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
+          setDragging(isOverDropZone(payload.position));
+        } else if (payload.type === "drop") {
+          const over = isOverDropZone(payload.position);
+          setDragging(false);
+          if (!over) return;
+          if (payload.paths.length === 0) {
+            setMessage("请使用上传按钮");
+            return;
+          }
+          void upload(payload.paths);
+        } else {
+          setDragging(false);
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((error) => setMessage(String(error)));
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [active, upload]);
+
   async function chooseFiles() {
     const selected = await open({ multiple: true });
     if (!selected) return;
@@ -114,13 +168,23 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
 
   async function download() {
     if (!profileId || disabled) return;
+    const trimmed = downloadPath.trim();
+    // Downloading always passes `-r` on the backend, so an unset/`~` path means "recursively
+    // pull the entire remote home directory" — a single misclick must not do that silently.
+    // See review I4.
+    if (trimmed === "" || trimmed === "~") {
+      const proceed = window.confirm(
+        "未填写远程下载路径，将递归下载整个远程家目录 (~)，可能耗时很长。确定继续吗？",
+      );
+      if (!proceed) return;
+    }
     const localPath = await save({ title: "下载到", defaultPath: "download" });
     if (!localPath) return;
     setMessage("");
     try {
       await invoke("gateway_transfer_download", {
         profileId,
-        remotePath: remotePath.trim() || "~",
+        remotePath: trimmed || "~",
         localPath,
       });
       setMessage("下载完成");
@@ -129,19 +193,6 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
     } finally {
       await loadTransferStatus();
     }
-  }
-
-  function onDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setDragging(false);
-    const paths = Array.from(event.dataTransfer.files)
-      .map((file) => (file as TauriFile).path)
-      .filter((path): path is string => Boolean(path));
-    if (paths.length === 0) {
-      setMessage("请使用上传按钮");
-      return;
-    }
-    void upload(paths);
   }
 
   return (
@@ -160,7 +211,7 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
             className="filter-select"
             value={profileId}
             onChange={(event) => setProfileId(event.target.value)}
-            disabled={transfer.state === "running"}
+            disabled={running}
           >
             {profiles.map((profile) => (
               <option key={profile.id} value={profile.id}>
@@ -170,7 +221,7 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
           </select>
         </label>
         <label>
-          远程路径
+          上传目标路径（远程）
           <input
             value={remotePath}
             onChange={(event) => setRemotePath(event.target.value)}
@@ -178,16 +229,20 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
             disabled={disabled}
           />
         </label>
+        <label>
+          下载来源路径（远程文件或目录）
+          <input
+            value={downloadPath}
+            onChange={(event) => setDownloadPath(event.target.value)}
+            placeholder="例如 ~/logs/app.log（留空将下载整个 ~，需二次确认）"
+            disabled={disabled}
+          />
+        </label>
         <p className="files-overwrite">同名文件将被覆盖</p>
 
         <div
+          ref={dropZoneRef}
           className={dragging ? "files-dropzone dragging" : "files-dropzone"}
-          onDragOver={(event) => {
-            event.preventDefault();
-            if (!disabled) setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={onDrop}
         >
           将文件或目录拖到这里上传
         </div>
@@ -200,7 +255,7 @@ export default function FilesPanel({ active, profiles, status }: FilesPanelProps
             上传目录
           </button>
           <button type="button" className="btn ghost" disabled={disabled} onClick={() => void download()}>
-            下载（另存为）
+            下载远程路径（另存为）
           </button>
         </div>
         {!connected && profileId && <p className="files-hint">请先连接此主机。</p>}

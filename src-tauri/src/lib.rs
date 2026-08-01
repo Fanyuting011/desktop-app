@@ -105,13 +105,18 @@ fn gateway_set_reconnect(
 }
 
 #[tauri::command]
-fn gateway_set_port_forward_preset(
+async fn gateway_set_port_forward_preset(
     state: tauri::State<'_, GatewayState>,
     profile_id: String,
     port: u16,
     enabled: bool,
 ) -> Result<gateway::manager::GatewayStatus, String> {
-    state.set_port_forward_preset(profile_id, port, enabled)
+    let state = (*state).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.set_port_forward_preset(profile_id, port, enabled)
+    })
+    .await
+    .map_err(|e| format!("端口转发任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -164,8 +169,9 @@ async fn gateway_transfer_download(
 #[tauri::command]
 fn gateway_transfer_status(
     state: tauri::State<'_, GatewayState>,
+    profile_id: Option<String>,
 ) -> gateway::manager::TransferStatus {
-    state.transfer_status()
+    state.transfer_status(profile_id)
 }
 
 #[tauri::command]

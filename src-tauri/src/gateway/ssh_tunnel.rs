@@ -73,13 +73,31 @@ fn enabled_local_ports(profile: &GatewayProfile) -> Vec<u16> {
         .collect()
 }
 
-/// When ssh stderr indicates a local bind failure, return a clearer message if one
-/// enabled local port can be identified (single rule, or exactly one port in stderr).
+/// True when `detail` contains `port` as a standalone number (not as a substring of a
+/// longer number, e.g. `13000` must not match port `3000`).
+fn contains_port_token(detail: &str, port: u16) -> bool {
+    let needle = port.to_string();
+    let bytes = detail.as_bytes();
+    detail.match_indices(&needle).any(|(idx, _)| {
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_digit();
+        let after_idx = idx + needle.len();
+        let after_ok = after_idx >= bytes.len() || !bytes[after_idx].is_ascii_digit();
+        before_ok && after_ok
+    })
+}
+
+/// When ssh stderr clearly indicates a *local* (`-L`) bind failure, return a clearer
+/// message with the offending local port, always keeping the original detail so nothing
+/// is lost. Remote (`-R`) port-forwarding failures — which use very similar wording
+/// (`bind`, `forwarding failed`) but mean the *server-side* listen port is occupied, not a
+/// local one — must never be rewritten into a "local port busy" message.
 fn format_bind_failure(detail: &str, profile: &GatewayProfile) -> String {
-    let is_bind_error = detail.contains("bind")
+    let mentions_remote_forwarding = detail.contains("remote port forwarding");
+    let mentions_local_bind = detail.contains("bind")
         || detail.contains("Address already in use")
+        || detail.contains("cannot listen to port")
         || detail.contains("forwarding failed");
-    if !is_bind_error {
+    if mentions_remote_forwarding || !mentions_local_bind {
         return detail.to_string();
     }
 
@@ -90,7 +108,7 @@ fn format_bind_failure(detail: &str, profile: &GatewayProfile) -> String {
         let matched: Vec<u16> = enabled_ports
             .iter()
             .copied()
-            .filter(|p| detail.contains(&p.to_string()))
+            .filter(|p| contains_port_token(detail, *p))
             .collect();
         if matched.len() == 1 {
             Some(matched[0])
@@ -100,7 +118,7 @@ fn format_bind_failure(detail: &str, profile: &GatewayProfile) -> String {
     };
 
     match port {
-        Some(n) => format!("本地端口 {n} 已被占用，请关掉占用进程或换端口"),
+        Some(n) => format!("本地端口 {n} 已被占用，请关掉占用进程或换端口（原始错误：{detail}）"),
         None => detail.to_string(),
     }
 }
@@ -493,4 +511,59 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with_ports(ports: &[u16]) -> GatewayProfile {
+        let mut profile = GatewayProfile::new_blank("t");
+        profile.port_forwards = ports
+            .iter()
+            .map(|p| GatewayProfile::preset_forward(*p))
+            .collect();
+        profile
+    }
+
+    #[test]
+    fn remote_forwarding_failure_is_not_rewritten() {
+        let profile = profile_with_ports(&[3000]);
+        let detail = "Warning: remote port forwarding failed for listen port 17890";
+        assert_eq!(format_bind_failure(detail, &profile), detail);
+    }
+
+    #[test]
+    fn single_rule_local_bind_failure_is_rewritten_with_original_detail() {
+        let profile = profile_with_ports(&[3000]);
+        let detail = "bind [127.0.0.1]:3000: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port: 3000";
+        let msg = format_bind_failure(detail, &profile);
+        assert!(msg.contains("本地端口 3000 已被占用"));
+        assert!(msg.contains(detail), "rewritten message must retain original stderr: {msg}");
+    }
+
+    #[test]
+    fn port_13000_does_not_match_3000() {
+        let profile = profile_with_ports(&[3000, 8080]);
+        let detail = "bind [127.0.0.1]:13000: Address already in use";
+        // Neither enabled port (3000, 8080) is a genuine standalone match in "13000", so
+        // the ambiguous multi-rule branch must fall back to the untouched original detail.
+        assert_eq!(format_bind_failure(detail, &profile), detail);
+    }
+
+    #[test]
+    fn multi_rule_unambiguous_port_is_rewritten() {
+        let profile = profile_with_ports(&[3000, 8080]);
+        let detail = "bind [127.0.0.1]:8080: Address already in use\ncannot listen to port: 8080";
+        let msg = format_bind_failure(detail, &profile);
+        assert!(msg.contains("本地端口 8080 已被占用"));
+        assert!(msg.contains(detail));
+    }
+
+    #[test]
+    fn non_bind_error_is_left_untouched() {
+        let profile = profile_with_ports(&[3000]);
+        let detail = "Permission denied (publickey,password)";
+        assert_eq!(format_bind_failure(detail, &profile), detail);
+    }
 }
