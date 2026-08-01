@@ -6,6 +6,7 @@ pub mod manager;
 mod profiles;
 mod proxy;
 mod ssh_tunnel;
+mod terminal;
 
 pub use manager::GatewayState;
 pub use network_log::NetworkLogEntry;

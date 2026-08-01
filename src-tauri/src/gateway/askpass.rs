@@ -62,12 +62,27 @@ impl AskpassEnv {
     }
 
     pub fn apply(&self, cmd: &mut Command) {
-        cmd.env("SSH_ASKPASS", &self.script_path);
-        cmd.env("SSH_ASKPASS_REQUIRE", "force");
+        for (k, v) in self.env_pairs() {
+            cmd.env(k, v);
+        }
+    }
+
+    /// Same environment variables as [`Self::apply`], as plain string pairs — used by
+    /// callers that build commands via a non-`std::process::Command` API (e.g.
+    /// `portable_pty::CommandBuilder` for the interactive terminal).
+    pub fn env_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = vec![
+            (
+                "SSH_ASKPASS".to_string(),
+                self.script_path.display().to_string(),
+            ),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+        ];
         // Some OpenSSH builds still check DISPLAY before honoring ASKPASS.
         if std::env::var_os("DISPLAY").is_none() {
-            cmd.env("DISPLAY", "1");
+            pairs.push(("DISPLAY".to_string(), "1".to_string()));
         }
+        pairs
     }
 }
 

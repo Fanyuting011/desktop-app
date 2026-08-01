@@ -14,50 +14,69 @@ pub struct SshTunnel {
     _askpass: Option<AskpassEnv>,
 }
 
-fn target(profile: &GatewayProfile) -> String {
+pub(crate) fn target(profile: &GatewayProfile) -> String {
     format!("{}@{}", profile.user.trim(), profile.host.trim())
 }
 
-fn base_ssh_cmd(profile: &GatewayProfile, askpass: Option<&AskpassEnv>) -> Command {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o")
-        .arg("ConnectTimeout=15")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("NumberOfPasswordPrompts=1")
-        .arg("-p")
-        .arg(profile.port.to_string());
+/// SSH CLI args shared by every invocation (tunnel, probes, remote exec, and the
+/// interactive terminal in `terminal.rs`). Does not include the ASKPASS env vars —
+/// callers apply those separately since `terminal.rs` builds a `portable_pty::CommandBuilder`
+/// rather than a `std::process::Command`.
+pub(crate) fn ssh_common_args(profile: &GatewayProfile) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "ConnectTimeout=15".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        "NumberOfPasswordPrompts=1".to_string(),
+        "-p".to_string(),
+        profile.port.to_string(),
+    ];
 
     let has_key = !profile.identity_file.trim().is_empty();
     let has_password = !profile.password.trim().is_empty();
 
     if has_key {
-        cmd.arg("-i").arg(profile.identity_file.trim());
+        args.push("-i".to_string());
+        args.push(profile.identity_file.trim().to_string());
     }
 
     if has_password {
-        if let Some(ap) = askpass {
-            ap.apply(&mut cmd);
-        }
         if has_key {
-            cmd.arg("-o")
-                .arg("PreferredAuthentications=publickey,password,keyboard-interactive");
+            args.push("-o".to_string());
+            args.push("PreferredAuthentications=publickey,password,keyboard-interactive".to_string());
         } else {
-            cmd.arg("-o")
-                .arg("PreferredAuthentications=password,keyboard-interactive");
-            cmd.arg("-o").arg("PubkeyAuthentication=no");
+            args.push("-o".to_string());
+            args.push("PreferredAuthentications=password,keyboard-interactive".to_string());
+            args.push("-o".to_string());
+            args.push("PubkeyAuthentication=no".to_string());
         }
     } else {
         // Key-only: never prompt interactively.
-        cmd.arg("-o").arg("BatchMode=yes");
-        cmd.arg("-o").arg("PreferredAuthentications=publickey");
+        args.push("-o".to_string());
+        args.push("BatchMode=yes".to_string());
+        args.push("-o".to_string());
+        args.push("PreferredAuthentications=publickey".to_string());
     }
 
+    args
+}
+
+fn base_ssh_cmd(profile: &GatewayProfile, askpass: Option<&AskpassEnv>) -> Command {
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_common_args(profile) {
+        cmd.arg(arg);
+    }
+    if !profile.password.trim().is_empty() {
+        if let Some(ap) = askpass {
+            ap.apply(&mut cmd);
+        }
+    }
     cmd
 }
 
-fn prepare_askpass(profile: &GatewayProfile) -> Result<Option<AskpassEnv>, String> {
+pub(crate) fn prepare_askpass(profile: &GatewayProfile) -> Result<Option<AskpassEnv>, String> {
     if profile.password.trim().is_empty() {
         return Ok(None);
     }

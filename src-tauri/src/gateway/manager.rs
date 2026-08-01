@@ -13,6 +13,7 @@ use super::port_alloc::allocate_port_pair;
 use super::profiles::{GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
 use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
+use super::terminal::TerminalHub;
 
 const OUTGATE_CLI: &str = include_str!("../../../scripts/server/outgate");
 const DEPLOY_SCRIPT: &str = include_str!("../../../scripts/server/deploy-outgate.sh");
@@ -86,6 +87,11 @@ struct Inner {
     pending: HashSet<String>,
     upstream: Option<UpstreamKind>,
     runtime: Option<tokio::runtime::Runtime>,
+    /// Interactive PTY-backed `ssh` sessions for the embedded terminal — independent of
+    /// `sessions`' `-N -R` data-plane tunnels. Wrapped in its own `Arc` (it manages its
+    /// own internal locking) so background reader threads never need to touch the
+    /// gateway-wide `Inner` mutex.
+    terminals: Arc<TerminalHub>,
 }
 
 /// RAII guard that removes a profile id from `Inner::pending` once `connect()` finishes,
@@ -123,6 +129,7 @@ impl GatewayState {
                 pending: HashSet::new(),
                 upstream: None,
                 runtime,
+                terminals: Arc::new(TerminalHub::new()),
             })),
         }
     }
@@ -403,6 +410,11 @@ impl GatewayState {
             Ok((session.profile.clone(), i.logs.clone()))
         })?;
 
+        // Kill any interactive terminal for this host before tearing down the tunnel —
+        // the terminal is a second, independent ssh process that would otherwise be
+        // left dangling once the profile shows as disconnected.
+        self.terminal_close(profile.id.clone());
+
         let _ = remote_run_shell(
             &profile,
             "export PATH=\"$HOME/.outgate/bin:$PATH\"; outgate off >/dev/null 2>&1 || true",
@@ -523,6 +535,34 @@ impl GatewayState {
             }
             Ok(())
         })
+    }
+
+    /// Open an interactive PTY-backed `ssh` session for `profile_id`'s embedded terminal.
+    /// Requires the profile to already have a connected tunnel session (`connect()`).
+    pub fn terminal_open(&self, app: AppHandle, profile_id: String) -> Result<(), String> {
+        let (profile, terminals) = self.with_inner(|i| {
+            let session = i
+                .sessions
+                .get(&profile_id)
+                .ok_or_else(|| "该主机未连接，请先连接后再打开终端".to_string())?;
+            Ok::<_, String>((session.profile.clone(), i.terminals.clone()))
+        })?;
+        terminals.open(app, &profile)
+    }
+
+    pub fn terminal_write(&self, profile_id: String, data: String) -> Result<(), String> {
+        let terminals = self.with_inner(|i| i.terminals.clone());
+        terminals.write(&profile_id, &data)
+    }
+
+    pub fn terminal_resize(&self, profile_id: String, cols: u16, rows: u16) -> Result<(), String> {
+        let terminals = self.with_inner(|i| i.terminals.clone());
+        terminals.resize(&profile_id, cols, rows)
+    }
+
+    pub fn terminal_close(&self, profile_id: String) {
+        let terminals = self.with_inner(|i| i.terminals.clone());
+        terminals.close(&profile_id);
     }
 }
 

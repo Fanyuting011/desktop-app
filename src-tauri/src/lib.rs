@@ -109,6 +109,37 @@ fn gateway_new_profile() -> GatewayProfile {
     GatewayProfile::new_blank("新服务器")
 }
 
+#[tauri::command]
+async fn gateway_terminal_open(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let state = (*state).clone();
+    tauri::async_runtime::spawn_blocking(move || state.terminal_open(app, profile_id))
+        .await
+        .map_err(|e| format!("打开终端任务异常: {e}"))?
+}
+
+#[tauri::command]
+fn gateway_terminal_write(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+    data: String,
+) -> Result<(), String> {
+    state.terminal_write(profile_id, data)
+}
+
+#[tauri::command]
+fn gateway_terminal_resize(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    state.terminal_resize(profile_id, cols, rows)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -134,6 +165,9 @@ pub fn run() {
             gateway_poll,
             gateway_set_reconnect,
             gateway_new_profile,
+            gateway_terminal_open,
+            gateway_terminal_write,
+            gateway_terminal_resize,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
