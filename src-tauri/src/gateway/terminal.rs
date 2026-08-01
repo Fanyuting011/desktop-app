@@ -96,17 +96,27 @@ impl TerminalHub {
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
+            // Bytes read but not yet emitted because they end mid-multibyte-UTF-8-sequence
+            // (a single `read()` can split a char across two syscalls, e.g. a 3-byte CJK
+            // char landing right at the end of the buffer) — held until the rest arrives.
+            let mut pending: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        if app.emit(&event_name, chunk).is_err() {
+                        pending.extend_from_slice(&buf[..n]);
+                        let chunk = drain_utf8_prefix(&mut pending);
+                        if !chunk.is_empty() && app.emit(&event_name, chunk).is_err() {
                             break;
                         }
                     }
                     Err(_) => break,
                 }
+            }
+            // Flush any trailing incomplete bytes (e.g. the ssh process died mid-char)
+            // rather than silently dropping them.
+            if !pending.is_empty() {
+                let _ = app.emit(&event_name, String::from_utf8_lossy(&pending).into_owned());
             }
         });
 
@@ -168,5 +178,81 @@ impl TerminalHub {
 impl Default for TerminalHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drain the leading, complete-UTF-8 prefix of `pending` into a `String`, leaving any
+/// trailing incomplete multibyte sequence (at most 3 bytes — a valid UTF-8 char is at
+/// most 4 bytes, so the 4th byte would always complete it) in `pending` for the next
+/// read to complete.
+///
+/// If the trailing bytes are *not* actually a truncated char (e.g. the remote sent
+/// genuinely non-UTF-8 binary data), they can never grow past 3 bytes before being
+/// resolved: the next call either finds them completed into a valid prefix, or — once
+/// there's no way they could still be a legitimate truncated char — flushes them
+/// lossily instead of buffering forever.
+fn drain_utf8_prefix(pending: &mut Vec<u8>) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let valid_up_to = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    // A genuinely truncated (but eventually valid) UTF-8 sequence is at most 3 bytes
+    // long here (the 4th byte would complete it) — anything longer than that can't be a
+    // legitimate truncation and must be flushed instead of held forever.
+    let incomplete_tail_len = pending.len() - valid_up_to;
+    let take_len = if incomplete_tail_len > 3 {
+        pending.len()
+    } else {
+        valid_up_to
+    };
+    let bytes: Vec<u8> = pending.drain(..take_len).collect();
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_utf8_prefix;
+
+    #[test]
+    fn drains_complete_ascii() {
+        let mut pending = b"hello world".to_vec();
+        assert_eq!(drain_utf8_prefix(&mut pending), "hello world");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn holds_back_split_multibyte_char() {
+        // "中" (U+4E2D) is E4 B8 AD in UTF-8 — simulate a read() that stopped mid-char.
+        let full = "hi 中".as_bytes().to_vec();
+        let split_at = full.len() - 1; // cut the last byte of the 3-byte char
+        let mut pending = full[..split_at].to_vec();
+        let first = drain_utf8_prefix(&mut pending);
+        assert_eq!(first, "hi ");
+        assert_eq!(pending.len(), 2, "the 2 valid lead bytes of 中 stay pending");
+
+        // The rest of the char arrives in the next read.
+        pending.extend_from_slice(&full[split_at..]);
+        let second = drain_utf8_prefix(&mut pending);
+        assert_eq!(second, "中");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn flushes_genuinely_invalid_tail_instead_of_growing_forever() {
+        // 5 consecutive continuation-only bytes can never become a valid char no matter
+        // how much more data arrives — must not be buffered indefinitely.
+        let mut pending = vec![0x80u8; 5];
+        let out = drain_utf8_prefix(&mut pending);
+        assert!(!out.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn empty_input_is_a_noop() {
+        let mut pending = Vec::new();
+        assert_eq!(drain_utf8_prefix(&mut pending), "");
     }
 }

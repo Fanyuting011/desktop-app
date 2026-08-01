@@ -462,6 +462,13 @@ impl GatewayState {
                     }
                 };
                 if dead {
+                    // The interactive terminal (if open) is a second, independent ssh
+                    // process tied to the same host. Once the tunnel itself has died,
+                    // close it too — whether we're about to auto-reconnect (Task 8's UI
+                    // will reopen a fresh terminal once reconnected) or dropping the
+                    // session entirely — so it never leaks as an orphaned ssh process.
+                    i.terminals.close(&id);
+
                     let (name, auto) = {
                         let s = i.sessions.get(&id).unwrap();
                         (s.profile.name.clone(), s.profile.auto_reconnect)
