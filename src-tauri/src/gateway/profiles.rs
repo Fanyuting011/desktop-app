@@ -102,6 +102,25 @@ impl GatewayProfile {
     }
 }
 
+pub fn apply_preset(forwards: &mut Vec<PortForwardRule>, port: u16, enabled: bool) {
+    let rule = forwards.iter_mut().find(|rule| {
+        is_loopback(&rule.local_host)
+            && rule.local_port == port
+            && rule.remote_host == "127.0.0.1"
+            && rule.remote_port == port
+    });
+
+    match rule {
+        Some(rule) => rule.enabled = enabled,
+        None if enabled => forwards.push(GatewayProfile::preset_forward(port)),
+        None => {}
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ProfilesFile {
@@ -215,5 +234,31 @@ mod tests {
         let raw = r#"{"id":"1","name":"t","host":"h","port":22,"user":"u","identityFile":"","password":"","remoteHttpPort":17890,"remoteSocksPort":17891,"autoReconnect":true,"noProxy":[],"updatedAt":"x"}"#;
         let p: GatewayProfile = serde_json::from_str(raw).unwrap();
         assert!(p.port_forwards.is_empty());
+    }
+
+    #[test]
+    fn apply_preset_creates_then_disables_loopback_rule() {
+        let mut forwards = vec![];
+
+        apply_preset(&mut forwards, 3000, true);
+        assert_eq!(forwards.len(), 1);
+        assert!(forwards[0].enabled);
+        assert_eq!(forwards[0].local_host, "127.0.0.1");
+        assert_eq!(forwards[0].local_port, 3000);
+        assert_eq!(forwards[0].remote_host, "127.0.0.1");
+        assert_eq!(forwards[0].remote_port, 3000);
+
+        apply_preset(&mut forwards, 3000, false);
+        assert_eq!(forwards.len(), 1);
+        assert!(!forwards[0].enabled);
+    }
+
+    #[test]
+    fn apply_preset_leaves_missing_disabled_rule_absent() {
+        let mut forwards = vec![];
+
+        apply_preset(&mut forwards, 8080, false);
+
+        assert!(forwards.is_empty());
     }
 }

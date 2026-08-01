@@ -105,6 +105,16 @@ fn gateway_set_reconnect(
 }
 
 #[tauri::command]
+fn gateway_set_port_forward_preset(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+    port: u16,
+    enabled: bool,
+) -> Result<gateway::manager::GatewayStatus, String> {
+    state.set_port_forward_preset(profile_id, port, enabled)
+}
+
+#[tauri::command]
 fn gateway_new_profile() -> GatewayProfile {
     GatewayProfile::new_blank("新服务器")
 }
@@ -164,6 +174,7 @@ pub fn run() {
             gateway_disconnect,
             gateway_poll,
             gateway_set_reconnect,
+            gateway_set_port_forward_preset,
             gateway_new_profile,
             gateway_terminal_open,
             gateway_terminal_write,

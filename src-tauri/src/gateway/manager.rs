@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::log_buffer::LogBuffer;
 use super::network_log::{NetworkLogBuffer, NetworkLogEntry};
 use super::port_alloc::allocate_port_pair;
-use super::profiles::{GatewayProfile, ProfilesStore};
+use super::profiles::{apply_preset, GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
 use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
 use super::terminal::TerminalHub;
@@ -578,6 +578,76 @@ impl GatewayState {
                 let _ = i.profiles.upsert(p);
             }
             Ok(())
+        })
+    }
+
+    pub fn set_port_forward_preset(
+        &self,
+        profile_id: String,
+        port: u16,
+        enabled: bool,
+    ) -> Result<GatewayStatus, String> {
+        if !matches!(port, 3000 | 8080 | 5432) {
+            return Err(format!("不支持端口 {port}；仅支持 3000、8080、5432"));
+        }
+
+        let (profile, should_respawn) = self.with_inner(|i| {
+            let mut profile = i
+                .profiles
+                .get(&profile_id)
+                .ok_or_else(|| "配置不存在".to_string())?;
+            apply_preset(&mut profile.port_forwards, port, enabled);
+            let profile = i.profiles.upsert(profile)?;
+
+            let should_respawn = if let Some(session) = i.sessions.get_mut(&profile_id) {
+                session.profile = profile.clone();
+                matches!(session.phase, Phase::Connected | Phase::Reconnecting)
+            } else {
+                false
+            };
+            Ok::<_, String>((profile, should_respawn))
+        })?;
+
+        if should_respawn {
+            self.respawn_tunnel_keep_proxy(&profile)?;
+        }
+        Ok(self.status())
+    }
+
+    fn respawn_tunnel_keep_proxy(&self, profile: &GatewayProfile) -> Result<(), String> {
+        let id = profile.id.clone();
+        let (local_http, local_socks, logs) = self.with_inner(|i| {
+            let session = i
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| "会话已丢失，无法重建隧道".to_string())?;
+            session.tunnel.kill();
+            i.reconnecting.insert(id.clone());
+            Ok::<_, String>((session.local_http, session.local_socks, i.logs.clone()))
+        })?;
+
+        let tunnel = SshTunnel::spawn(profile, local_http, local_socks, logs);
+        self.with_inner(|i| {
+            i.reconnecting.remove(&id);
+            match tunnel {
+                Ok(tunnel) => {
+                    if let Some(session) = i.sessions.get_mut(&id) {
+                        session.tunnel = tunnel;
+                        session.last_error = None;
+                    }
+                    i.logs
+                        .push(format!("[{}] 已应用端口转发预设", profile.name));
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Some(session) = i.sessions.get_mut(&id) {
+                        session.last_error = Some(error.clone());
+                    }
+                    i.logs
+                        .push(format!("[{}] 重建端口转发隧道失败: {error}", profile.name));
+                    Err(error)
+                }
+            }
         })
     }
 
