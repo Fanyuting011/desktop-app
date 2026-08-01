@@ -9,6 +9,7 @@ mod proxy;
 mod ssh_bin;
 mod ssh_tunnel;
 mod terminal;
+mod transfer;
 
 pub use manager::GatewayState;
 pub use network_log::NetworkLogEntry;

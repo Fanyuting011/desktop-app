@@ -14,6 +14,7 @@ use super::profiles::{apply_preset, GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
 use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
 use super::terminal::TerminalHub;
+use super::transfer::{run_download, run_upload};
 
 const OUTGATE_CLI: &str = include_str!("../../../scripts/server/outgate");
 const DEPLOY_SCRIPT: &str = include_str!("../../../scripts/server/deploy-outgate.sh");
@@ -51,6 +52,14 @@ pub struct GatewayStatus {
     pub local_http: String,
     pub local_socks: String,
     pub upstream_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferStatus {
+    pub profile_id: Option<String>,
+    pub state: String,
+    pub detail: Option<String>,
 }
 
 struct LiveSession {
@@ -97,6 +106,9 @@ struct Inner {
     /// tunnel keeps reporting dead from `try_wait()` until it is replaced, so without this
     /// guard every 3s poll would enqueue yet another reconnect on top of the in-flight one.
     reconnecting: HashMap<String, u64>,
+    /// Profile ids with an SCP process in flight. A profile may only run one transfer at a
+    /// time, while transfers to separate connected profiles remain independent.
+    transfer_busy: HashSet<String>,
     /// Never reset across disconnect/reconnect, so a stale task cannot match a new session
     /// that reuses the same profile id.
     next_generation: u64,
@@ -124,6 +136,20 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Releases a profile's transfer reservation even when launching or running `scp` fails.
+struct TransferGuard {
+    state: GatewayState,
+    id: String,
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        self.state.with_inner(|i| {
+            i.transfer_busy.remove(&self.id);
+        });
+    }
+}
+
 impl GatewayState {
     pub fn new(app: &AppHandle) -> Self {
         let dir = app
@@ -144,6 +170,7 @@ impl GatewayState {
                 sessions: HashMap::new(),
                 pending: HashSet::new(),
                 reconnecting: HashMap::new(),
+                transfer_busy: HashSet::new(),
                 next_generation: 0,
                 upstream: None,
                 runtime,
@@ -834,6 +861,64 @@ impl GatewayState {
     pub fn terminal_close(&self, profile_id: String) {
         let terminals = self.with_inner(|i| i.terminals.clone());
         terminals.close(&profile_id);
+    }
+
+    pub fn transfer_upload(
+        &self,
+        profile_id: String,
+        local_path: String,
+        remote_path: String,
+    ) -> Result<(), String> {
+        let profile = self.reserve_transfer(&profile_id)?;
+        let _guard = TransferGuard {
+            state: self.clone(),
+            id: profile_id,
+        };
+        run_upload(&profile, &local_path, &remote_path)
+    }
+
+    pub fn transfer_download(
+        &self,
+        profile_id: String,
+        remote_path: String,
+        local_path: String,
+    ) -> Result<(), String> {
+        let profile = self.reserve_transfer(&profile_id)?;
+        let _guard = TransferGuard {
+            state: self.clone(),
+            id: profile_id,
+        };
+        run_download(&profile, &remote_path, &local_path)
+    }
+
+    pub fn transfer_status(&self) -> TransferStatus {
+        self.with_inner(|i| {
+            let profile_id = i.transfer_busy.iter().min().cloned();
+            TransferStatus {
+                state: if profile_id.is_some() {
+                    "running".to_string()
+                } else {
+                    "idle".to_string()
+                },
+                detail: profile_id.as_ref().map(|id| format!("主机 {id} 正在传输")),
+                profile_id,
+            }
+        })
+    }
+
+    fn reserve_transfer(&self, profile_id: &str) -> Result<GatewayProfile, String> {
+        self.with_inner(|i| {
+            let profile = i
+                .sessions
+                .get(profile_id)
+                .ok_or_else(|| "请先 Connect 该主机".to_string())?
+                .profile
+                .clone();
+            if !i.transfer_busy.insert(profile_id.to_string()) {
+                return Err("请等待当前传输完成".to_string());
+            }
+            Ok(profile)
+        })
     }
 }
 

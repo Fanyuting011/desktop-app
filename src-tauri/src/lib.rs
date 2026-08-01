@@ -132,6 +132,43 @@ async fn gateway_terminal_open(
 }
 
 #[tauri::command]
+async fn gateway_transfer_upload(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let state = (*state).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.transfer_upload(profile_id, local_path, remote_path)
+    })
+    .await
+    .map_err(|e| format!("上传任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn gateway_transfer_download(
+    state: tauri::State<'_, GatewayState>,
+    profile_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let state = (*state).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state.transfer_download(profile_id, remote_path, local_path)
+    })
+    .await
+    .map_err(|e| format!("下载任务异常: {e}"))?
+}
+
+#[tauri::command]
+fn gateway_transfer_status(
+    state: tauri::State<'_, GatewayState>,
+) -> gateway::manager::TransferStatus {
+    state.transfer_status()
+}
+
+#[tauri::command]
 fn gateway_terminal_write(
     state: tauri::State<'_, GatewayState>,
     profile_id: String,
@@ -177,6 +214,9 @@ pub fn run() {
             gateway_set_port_forward_preset,
             gateway_new_profile,
             gateway_terminal_open,
+            gateway_transfer_upload,
+            gateway_transfer_download,
+            gateway_transfer_status,
             gateway_terminal_write,
             gateway_terminal_resize,
         ])
