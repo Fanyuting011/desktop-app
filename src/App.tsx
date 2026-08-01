@@ -6,12 +6,13 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import LogsPanel from "./components/LogsPanel";
 import NetworkPanel from "./components/NetworkPanel";
+import FilesPanel from "./components/FilesPanel";
 import HostTerminal from "./components/HostTerminal";
 import ConnectingOverlay from "./components/ConnectingOverlay";
 import "./App.css";
 
 type Phase = "idle" | "connected" | "proxyOn" | "reconnecting";
-type Nav = "hosts" | "logs" | "network";
+type Nav = "hosts" | "logs" | "network" | "files";
 // "hosts" or a connected session's profileId (its terminal tab).
 type CenterTab = string;
 
@@ -430,6 +431,13 @@ export default function App() {
         >
           Network
         </button>
+        <button
+          type="button"
+          className={nav === "files" ? "nav-item active" : "nav-item"}
+          onClick={() => setNav("files")}
+        >
+          Files
+        </button>
         <div className="nav-foot">
           <button type="button" className="nav-update" disabled={busy} onClick={checkUpdate}>
             Check for updates
@@ -795,6 +803,7 @@ export default function App() {
           noProxySummary={noProxySummary}
         />
       )}
+      {nav === "files" && <FilesPanel active={nav === "files"} profiles={profiles} status={status} />}
     </div>
   );
 }
