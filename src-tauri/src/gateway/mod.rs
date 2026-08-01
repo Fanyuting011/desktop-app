@@ -1,4 +1,5 @@
 mod askpass;
+mod classify;
 mod log_buffer;
 mod network_log;
 mod port_alloc;
