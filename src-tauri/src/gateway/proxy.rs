@@ -1,8 +1,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+
+use super::network_log::{NetworkLogBuffer, NetworkLogEntry};
 
 #[derive(Debug, Clone)]
 pub enum UpstreamKind {
@@ -71,6 +74,8 @@ pub async fn start_local_proxies(
     http_port: u16,
     socks_port: u16,
     upstream: Option<UpstreamKind>,
+    profile_id: String,
+    net_log: Arc<NetworkLogBuffer>,
 ) -> Result<ProxyHandles, String> {
     let http_listener = TcpListener::bind(("127.0.0.1", http_port))
         .await
@@ -84,16 +89,33 @@ pub async fn start_local_proxies(
     let running = Arc::new(AtomicBool::new(true));
     let upstream_http = Arc::new(upstream.clone());
     let upstream_socks = upstream_http.clone();
+    let profile_id = Arc::new(profile_id);
 
     let running_http = running.clone();
+    let http_profile_id = profile_id.clone();
+    let http_net_log = net_log.clone();
     tokio::spawn(async move {
-        run_http_proxy(http_listener, stop_rx_http, upstream_http).await;
+        run_http_proxy(
+            http_listener,
+            stop_rx_http,
+            upstream_http,
+            http_profile_id,
+            http_net_log,
+        )
+        .await;
         running_http.store(false, Ordering::SeqCst);
     });
 
     let running_socks = running.clone();
     tokio::spawn(async move {
-        run_socks_proxy(socks_listener, stop_rx_socks, upstream_socks).await;
+        run_socks_proxy(
+            socks_listener,
+            stop_rx_socks,
+            upstream_socks,
+            profile_id,
+            net_log,
+        )
+        .await;
         running_socks.store(false, Ordering::SeqCst);
     });
 
@@ -103,6 +125,31 @@ pub async fn start_local_proxies(
         socks_addr: format!("127.0.0.1:{socks_port}"),
         running,
     })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn push_network_log(
+    net_log: &NetworkLogBuffer,
+    profile_id: &str,
+    protocol: &str,
+    target: &str,
+    error: Option<String>,
+) {
+    net_log.push(NetworkLogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        ts_ms: now_ms(),
+        profile_id: profile_id.to_string(),
+        protocol: protocol.to_string(),
+        target: target.to_string(),
+        ok: error.is_none(),
+        error,
+    });
 }
 
 async fn dial_target(
@@ -210,6 +257,8 @@ async fn run_http_proxy(
     listener: TcpListener,
     mut stop_rx: watch::Receiver<bool>,
     upstream: Arc<Option<UpstreamKind>>,
+    profile_id: Arc<String>,
+    net_log: Arc<NetworkLogBuffer>,
 ) {
     loop {
         tokio::select! {
@@ -222,8 +271,16 @@ async fn run_http_proxy(
                 match accept {
                     Ok((stream, _)) => {
                         let up = upstream.clone();
+                        let profile_id = profile_id.clone();
+                        let net_log = net_log.clone();
                         tokio::spawn(async move {
-                            let _ = handle_http_client(stream, up.as_ref().as_ref()).await;
+                            let _ = handle_http_client(
+                                stream,
+                                up.as_ref().as_ref(),
+                                &profile_id,
+                                &net_log,
+                            )
+                            .await;
                         });
                     }
                     Err(_) => break,
@@ -236,6 +293,8 @@ async fn run_http_proxy(
 async fn handle_http_client(
     mut client: TcpStream,
     upstream: Option<&UpstreamKind>,
+    profile_id: &str,
+    net_log: &NetworkLogBuffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 8192];
     let n = client.read(&mut buf).await?;
@@ -253,11 +312,27 @@ async fn handle_http_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let hostport = target;
-        let remote = dial_target(hostport, upstream).await?;
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
-        relay(client, remote).await?;
+        match dial_target(hostport, upstream).await {
+            Ok(remote) => {
+                push_network_log(net_log, profile_id, "http", hostport, None);
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                relay(client, remote).await?;
+            }
+            Err(error) => {
+                push_network_log(
+                    net_log,
+                    profile_id,
+                    "http",
+                    hostport,
+                    Some(error.to_string()),
+                );
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                    .await?;
+            }
+        }
         return Ok(());
     }
 
@@ -341,6 +416,8 @@ async fn run_socks_proxy(
     listener: TcpListener,
     mut stop_rx: watch::Receiver<bool>,
     upstream: Arc<Option<UpstreamKind>>,
+    profile_id: Arc<String>,
+    net_log: Arc<NetworkLogBuffer>,
 ) {
     loop {
         tokio::select! {
@@ -353,8 +430,16 @@ async fn run_socks_proxy(
                 match accept {
                     Ok((stream, _)) => {
                         let up = upstream.clone();
+                        let profile_id = profile_id.clone();
+                        let net_log = net_log.clone();
                         tokio::spawn(async move {
-                            let _ = handle_socks_client(stream, up.as_ref().as_ref()).await;
+                            let _ = handle_socks_client(
+                                stream,
+                                up.as_ref().as_ref(),
+                                &profile_id,
+                                &net_log,
+                            )
+                            .await;
                         });
                     }
                     Err(_) => break,
@@ -367,6 +452,8 @@ async fn run_socks_proxy(
 async fn handle_socks_client(
     mut client: TcpStream,
     upstream: Option<&UpstreamKind>,
+    profile_id: &str,
+    net_log: &NetworkLogBuffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = [0u8; 2];
     client.read_exact(&mut buf).await?;
@@ -422,16 +509,187 @@ async fn handle_socks_client(
 
     match dial_target(&dest, upstream).await {
         Ok(remote) => {
+            push_network_log(net_log, profile_id, "socks", &dest, None);
             client
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
             relay(client, remote).await?;
         }
-        Err(_) => {
+        Err(error) => {
+            push_network_log(net_log, profile_id, "socks", &dest, Some(error.to_string()));
             client
                 .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::network_log::{NetworkLogBuffer, NetworkLogEntry};
+    use tokio::time::{sleep, Duration};
+
+    async fn unused_port_pair() -> (u16, u16) {
+        let first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let second = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        (
+            first.local_addr().unwrap().port(),
+            second.local_addr().unwrap().port(),
+        )
+    }
+
+    async fn unused_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    async fn wait_for_log(logs: &NetworkLogBuffer) -> NetworkLogEntry {
+        for _ in 0..20 {
+            if let Some(entry) = logs.snapshot(None, 1).into_iter().next() {
+                return entry;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("network log was not emitted");
+    }
+
+    #[tokio::test]
+    async fn http_connect_emits_success_log() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = target.accept().await;
+        });
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-http".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = [0u8; 39];
+        let _ = client.read(&mut response).await.unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.profile_id, "profile-http");
+        assert_eq!(entry.protocol, "http");
+        assert_eq!(entry.target, target_addr.to_string());
+        assert!(entry.ok);
+        assert!(entry.error.is_none());
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn http_connect_emits_failure_log() {
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-http-fail".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+        let target_port = unused_port().await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.protocol, "http");
+        assert_eq!(entry.target, format!("127.0.0.1:{target_port}"));
+        assert!(!entry.ok);
+        assert!(entry.error.is_some());
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn socks_connect_emits_success_log() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = target.accept().await;
+        });
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-socks".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", socks_port)).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&target_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.profile_id, "profile-socks");
+        assert_eq!(entry.protocol, "socks");
+        assert_eq!(entry.target, target_addr.to_string());
+        assert!(entry.ok);
+        assert!(entry.error.is_none());
+        proxy.stop();
+    }
+
+    #[tokio::test]
+    async fn socks_connect_emits_failure_log() {
+        let (http_port, socks_port) = unused_port_pair().await;
+        let logs = Arc::new(NetworkLogBuffer::new());
+        let proxy = start_local_proxies(
+            http_port,
+            socks_port,
+            None,
+            "profile-socks-fail".into(),
+            logs.clone(),
+        )
+        .await
+        .unwrap();
+        let target_port = unused_port().await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", socks_port)).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&target_port.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.unwrap();
+
+        let entry = wait_for_log(&logs).await;
+        assert_eq!(entry.protocol, "socks");
+        assert_eq!(entry.target, format!("127.0.0.1:{target_port}"));
+        assert!(!entry.ok);
+        assert!(entry.error.is_some());
+        proxy.stop();
+    }
 }

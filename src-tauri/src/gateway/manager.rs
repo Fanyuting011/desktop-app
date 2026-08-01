@@ -8,6 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use super::log_buffer::LogBuffer;
+use super::network_log::NetworkLogBuffer;
 use super::profiles::{GatewayProfile, ProfilesStore};
 use super::proxy::{start_local_proxies, ProxyHandles, UpstreamKind};
 use super::ssh_tunnel::{remote_run_script, remote_run_shell, SshTunnel};
@@ -68,6 +69,7 @@ impl Clone for GatewayState {
 struct Inner {
     profiles: ProfilesStore,
     logs: Arc<LogBuffer>,
+    network_logs: Arc<NetworkLogBuffer>,
     sessions: HashMap<String, LiveSession>,
     /// Connect/reconnect in flight — keeps shared proxy alive before session is inserted.
     connecting: usize,
@@ -91,6 +93,7 @@ impl GatewayState {
             inner: Arc::new(Mutex::new(Inner {
                 profiles: ProfilesStore::load(path),
                 logs: Arc::new(LogBuffer::new()),
+                network_logs: Arc::new(NetworkLogBuffer::new()),
                 sessions: HashMap::new(),
                 connecting: 0,
                 shared_proxy: None,
@@ -221,6 +224,8 @@ impl GatewayState {
                     SHARED_LOCAL_HTTP,
                     SHARED_LOCAL_SOCKS,
                     upstream.clone(),
+                    profile.id.clone(),
+                    i.network_logs.clone(),
                 )) {
                     Ok(p) => p,
                     Err(e) => {
@@ -423,6 +428,8 @@ impl GatewayState {
                     SHARED_LOCAL_HTTP,
                     SHARED_LOCAL_SOCKS,
                     upstream,
+                    profile.id.clone(),
+                    i.network_logs.clone(),
                 )) {
                     Ok(p) => p,
                     Err(e) => {
