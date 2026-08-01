@@ -96,6 +96,12 @@ function statusDot(phase: Phase, busy: boolean): string {
   return "dot gray";
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export default function App() {
   const [nav, setNav] = useState<Nav>("hosts");
   const [centerTab, setCenterTab] = useState<CenterTab>("hosts");
@@ -107,6 +113,12 @@ export default function App() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [presetBusyPort, setPresetBusyPort] = useState<number | null>(null);
   const [message, setMessage] = useState("");
+  const [updateProgress, setUpdateProgress] = useState<{
+    version: string;
+    downloaded: number;
+    total: number | null;
+    phase: "checking" | "downloading" | "installing";
+  } | null>(null);
   const [query, setQuery] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [connectingProfile, setConnectingProfile] = useState<GatewayProfile | null>(null);
@@ -379,6 +391,13 @@ export default function App() {
 
   async function checkUpdate() {
     setBusy(true);
+    setMessage("");
+    setUpdateProgress({
+      version: "",
+      downloaded: 0,
+      total: null,
+      phase: "checking",
+    });
     const trimmed = upstream.trim();
     const proxy = trimmed
       ? /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)
@@ -394,13 +413,50 @@ export default function App() {
         setMessage("已是最新版本");
         return;
       }
+      let downloaded = 0;
+      let total: number | null = null;
+      setUpdateProgress({
+        version: update.version,
+        downloaded: 0,
+        total: null,
+        phase: "downloading",
+      });
       setMessage(`发现 ${update.version}，下载中…`);
-      await update.downloadAndInstall(() => {});
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? null;
+          downloaded = 0;
+          setUpdateProgress({
+            version: update.version,
+            downloaded: 0,
+            total,
+            phase: "downloading",
+          });
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setUpdateProgress({
+            version: update.version,
+            downloaded,
+            total,
+            phase: "downloading",
+          });
+        } else if (event.event === "Finished") {
+          setUpdateProgress({
+            version: update.version,
+            downloaded,
+            total,
+            phase: "installing",
+          });
+          setMessage(`正在安装 ${update.version}…`);
+        }
+      });
+      setMessage("安装完成，正在重启…");
       await relaunch();
     } catch (e) {
       setMessage(`更新失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(false);
+      setUpdateProgress(null);
     }
   }
 
@@ -441,8 +497,49 @@ export default function App() {
         </button>
         <div className="nav-foot">
           <button type="button" className="nav-update" disabled={busy} onClick={checkUpdate}>
-            Check for updates
+            {updateProgress?.phase === "checking"
+              ? "检查更新…"
+              : updateProgress?.phase === "downloading"
+                ? "下载更新中…"
+                : updateProgress?.phase === "installing"
+                  ? "安装中…"
+                  : "Check for updates"}
           </button>
+          {updateProgress && updateProgress.phase !== "checking" && (
+            <div className="update-progress" aria-live="polite">
+              <div className="update-progress-track">
+                <div
+                  className={
+                    updateProgress.phase === "downloading" &&
+                    !(updateProgress.total && updateProgress.total > 0)
+                      ? "update-progress-bar indeterminate"
+                      : "update-progress-bar"
+                  }
+                  style={{
+                    width:
+                      updateProgress.phase === "installing"
+                        ? "100%"
+                        : updateProgress.total && updateProgress.total > 0
+                          ? `${Math.min(
+                              100,
+                              Math.round((updateProgress.downloaded / updateProgress.total) * 100),
+                            )}%`
+                          : undefined,
+                  }}
+                />
+              </div>
+              <span className="update-progress-label">
+                {updateProgress.phase === "installing"
+                  ? `安装 v${updateProgress.version}`
+                  : updateProgress.total && updateProgress.total > 0
+                    ? `v${updateProgress.version} · ${formatBytes(updateProgress.downloaded)} / ${formatBytes(updateProgress.total)} · ${Math.min(
+                        100,
+                        Math.round((updateProgress.downloaded / updateProgress.total) * 100),
+                      )}%`
+                    : `v${updateProgress.version} · ${formatBytes(updateProgress.downloaded)}`}
+              </span>
+            </div>
+          )}
           <span className="nav-ver">v{version}</span>
         </div>
       </aside>
